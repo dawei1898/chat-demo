@@ -25,7 +25,7 @@ React → 自己的后端（认证、校验、限流、注入服务端 Key）→
 | 语音识别 | POST /v1/tools/asr | multipart 音频 |
 | 语音合成 | POST /v1/tools/tts | PCM 二进制流，不是 SSE |
 
-主要位置：`src/services/api/client.ts`、`src/services/api/speech.ts`、`src/services/api/sse.ts`、`src/services/chat/store.ts`、`src/services/chat/reply.ts`、`src/services/settings.ts`、`rspack.config.ts`。
+主要位置：`../../src/services/api/client.ts`、`src/services/api/speech.ts`、`src/services/api/sse.ts`、`src/services/chat/store.ts`、`src/services/chat/reply.ts`、`src/services/settings.ts`、`rspack.config.ts`。
 
 ## 3. 第一阶段：最小 BFF
 
@@ -80,4 +80,4 @@ Messages 流通常经过 message_start、content_block_start/delta/stop、messag
 
 本次工作目录：`/Users/fu/code/codex_projects/deepseek-chat-demo`，分支 `dev`。
 
-当前使用自有 Hono 后端，不再让浏览器直连模型或填写模型 Key。统一从 `http://localhost:8095/` 访问前端；Hono 仅在本机 8096 端口运行。服务端变量由项目根目录被 Git 忽略的 `.env` 提供，不在聊天或提交中传递。启动、测试及未完成范围以《本地开发启动说明》为准；本文不包含任何凭据。
+当前使用自有 Hono 后端，不再让浏览器直连模型或填写模型 Key。统一从 `http://localhost:8095/` 访问前端；Hono 仅在本机 8096 端口运行。服务端变量由项目根目录被 Git 忽略的 `../../.env` 提供，不在聊天或提交中传递。启动、测试及未完成范围以《本地开发启动说明》为准；本文不包含任何凭据。
