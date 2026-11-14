@@ -379,11 +379,25 @@ async function generate(id: string, input: GenerationInput) {
         error?.error?.code
       )
     }
+    if (response.headers.get('content-type')?.includes('application/json')) {
+      const result = (await response.json()) as { replay?: boolean; conversationId?: string }
+      assertCurrentSession(epoch)
+      if (result.replay === true && result.conversationId === id) {
+        // 同一幂等请求仅对账已存在任务，绝不重新调用模型或假定生成成功。
+        notify(new Error('请求已受理，正在刷新已保存的生成状态'))
+        return
+      }
+      throw new Error('服务返回了未知的生成状态')
+    }
     if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
       throw new Error('服务未返回 SSE 数据流')
     }
     for await (const frame of readServerSentEvents(response.body, controller.signal)) {
       assertCurrentSession(epoch)
+      // 未知扩展和心跳不属于业务状态帧，即使非 JSON 也应忽略。
+      if (!['snapshot', 'done', 'error'].includes(frame.event)) {
+        continue
+      }
       const data = JSON.parse(frame.data) as {
         session?: Session
         runId?: string
@@ -421,7 +435,7 @@ async function generate(id: string, input: GenerationInput) {
       set((s) => ({
         streaming: Object.fromEntries(Object.entries(s.streaming).filter(([key]) => key !== id)),
       }))
-      // The backend owns persistence. Reload after cancellation rather than overwriting it with UI state.
+      // 后端拥有持久化权威；中断后重新读取，不用界面状态覆盖数据库。
       await load(id)
       if (controller.signal.aborted) {
         for (let attempt = 0; attempt < 8; attempt += 1) {

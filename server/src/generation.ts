@@ -1,6 +1,13 @@
+import {
+  bounded,
+  boundedResponse,
+  generationBudgets,
+  GenerationFailure,
+  type GenerationBudgets,
+} from './generation-limits.js'
 import { assertContextBudget } from './context-budget.js'
 import { updateAttemptUsage, normalizeUsage } from './usage.js'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { pool } from './db/client.js'
 import { config } from './config.js'
@@ -57,15 +64,47 @@ export async function prepare(
     if (authSessionId && !(await sessionIsLive(q, userId, authSessionId))) {
       throw new HttpError(401, '登录已失效，请重新登录')
     }
+    // 同一用户的幂等检查与创建串行化，覆盖不同会话复用同一个 key 的并发。
+    await q.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [userId])
+    const requestHash = createHash('sha256')
+      .update(
+        JSON.stringify([
+          conversationId,
+          input.operation,
+          input.content ?? null,
+          input.messageId ?? null,
+          input.parentId ?? null,
+          input.thinking,
+          input.search,
+          input.expectedRevision ?? null,
+        ])
+      )
+      .digest('hex')
     let session = await loadSession(q, userId, conversationId, true)
-    assertRevision(session, input.expectedRevision)
     const duplicate = await q.query(
-      'SELECT id,status FROM generation_run WHERE user_id=$1 AND idempotency_key=$2',
+      'SELECT id,status,conversation_id,request_hash FROM generation_run WHERE user_id=$1 AND idempotency_key=$2',
       [userId, input.idempotencyKey]
     )
     if (duplicate.rowCount) {
-      throw new HttpError(409, '此请求已经提交，请刷新会话查看结果，不要重复生成')
+      const existing = duplicate.rows[0]
+      if (!existing.request_hash) {
+        throw new HttpError(
+          409,
+          '旧任务无法核验请求，请刷新会话查看结果',
+          'IDEMPOTENCY_LEGACY_UNKNOWN'
+        )
+      }
+      if (existing.request_hash !== requestHash) {
+        throw new HttpError(409, '同一个请求标识不能用于不同内容', 'IDEMPOTENCY_CONFLICT')
+      }
+      return {
+        replay: true as const,
+        runId: existing.id as string,
+        status: existing.status as string,
+        conversationId: existing.conversation_id as string,
+      }
     }
+    assertRevision(session, input.expectedRevision)
     await assertIdle(q, conversationId)
     const recent = await q.query(
       "SELECT COUNT(*)::int AS n FROM generation_run WHERE user_id=$1 AND created_at>NOW()-INTERVAL '1 minute'",
@@ -180,7 +219,7 @@ export async function prepare(
     await saveSession(q, session)
     const runId = randomUUID()
     await q.query(
-      "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status,auth_session_id) VALUES($1,$2,$3,$4,$5,$6,'running',$7)",
+      "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status,auth_session_id,request_hash) VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8)",
       [
         runId,
         userId,
@@ -189,72 +228,116 @@ export async function prepare(
         input.idempotencyKey,
         input.operation,
         authSessionId ?? null,
+        requestHash,
       ]
     )
     await q.query('INSERT INTO usage_record(generation_id) VALUES($1)', [runId])
-    return { session, reply, runId, body, userId, authSessionId }
+    return { replay: false as const, session, reply, runId, body, userId, authSessionId }
   })
 }
-/** 事务外消费上游事件，通过短检查点事务保存部分结果，结束时原子结算。 */
+/** 事务外消费上游；只有终态事务提交成功后才能向客户端宣布结果已保存。 */
 export async function execute(
-  prepared: Awaited<ReturnType<typeof prepare>>,
+  prepared: Exclude<Awaited<ReturnType<typeof prepare>>, { replay: true }>,
   signal: AbortSignal,
-  emit: (event: string, data: unknown) => Promise<void>
+  emit: (event: string, data: unknown) => Promise<void>,
+  budgetOverrides: Partial<GenerationBudgets> = {}
 ) {
+  const limits = { ...generationBudgets, ...budgetOverrides }
   const { runId } = prepared
   let session = prepared.session
   let reply: AssistantMessage = { ...prepared.reply, usage: undefined }
-  // 续写复用回答节点，但本次任务的用量从空值开始，不继承前次账本。
   let attemptUsage: Record<string, unknown> | null = null
   let sawFinalUsage = false
+  let seenStop = false
+  let refused = false
+  let failure: GenerationFailure | undefined
   const controller = new AbortController()
-  active.set(runId, controller)
   const abort = () => controller.abort()
+  let finishing = false
+  const fail = (error: GenerationFailure) => {
+    if (finishing) {
+      return
+    }
+    failure ??= error
+    controller.abort()
+  }
+  active.set(runId, controller)
   signal.addEventListener('abort', abort, { once: true })
   if (signal.aborted) {
     abort()
   }
-  let timedOut = false
-  const timer = setTimeout(() => {
-    timedOut = true
-    abort()
-  }, 240000)
-  let sessionExpired = false
-  let seenStop = false
-  let errorMessage: string | undefined
-  const indexes = new Map<number, number>()
-  let lastSnapshot = 0
-  let lastPersist = 0
-  let pollBusy = false
+  const timer = setTimeout(() => fail(new GenerationFailure('TOTAL_TIMEOUT')), limits.totalMs)
   const current = () => ({
     ...session,
     updatedAt: Date.now(),
     messages: session.messages.map((m) => (m.id === reply.id ? reply : m)),
   })
-  // 锁定会话后只更新仍在运行的任务，避免覆盖已完成或已回收的状态。
+  const publish = (event: string, data: unknown) =>
+    bounded(emit(event, data), limits.clientWriteMs, 'CLIENT_SLOW', controller.signal)
+  const writeUsage = async (
+    q: Parameters<Parameters<typeof inTransaction>[0]>[0],
+    complete: boolean
+  ) => {
+    const usage = normalizeUsage(attemptUsage, complete)
+    await q.query(
+      `UPDATE usage_record SET input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
+       raw_usage=$5,completeness=$6,updated_at=NOW() WHERE generation_id=$1`,
+      [
+        runId,
+        usage.input,
+        usage.cached,
+        usage.output,
+        JSON.stringify(usage.raw),
+        usage.completeness,
+      ]
+    )
+  }
+  // 检查点原子保存正文和本次用量；重启不会将已知用量误变成零。
   const checkpoint = async () => {
-    await inTransaction(async (q) => {
-      await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [session.id])
-      const r = await q.query(
+    try {
+      await inTransaction(async (q) => {
+        await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [session.id])
+        const r = await q.query(
+          "UPDATE generation_run SET heartbeat_at=NOW(),usage=$2 WHERE id=$1 AND status='running' RETURNING id",
+          [runId, JSON.stringify(attemptUsage)]
+        )
+        if (!r.rowCount) {
+          throw new GenerationFailure('LEASE_LOST')
+        }
+        await q.query('UPDATE message SET payload=$2 WHERE id=$1', [
+          reply.id,
+          JSON.stringify(reply),
+        ])
+        await writeUsage(q, false)
+      })
+    } catch (error) {
+      throw error instanceof GenerationFailure
+        ? error
+        : new GenerationFailure('DATABASE_UNAVAILABLE')
+    }
+  }
+  let heartbeatBusy = false
+  const heartbeat = setInterval(() => {
+    if (heartbeatBusy) {
+      return
+    }
+    heartbeatBusy = true
+    void pool
+      .query(
         "UPDATE generation_run SET heartbeat_at=NOW() WHERE id=$1 AND status='running' RETURNING id",
         [runId]
       )
-      if (!r.rowCount) {
-        controller.abort()
-        return
-      }
-      await q.query('UPDATE message SET payload=$2 WHERE id=$1', [reply.id, JSON.stringify(reply)])
-    })
-  }
-  // 心跳表明进程仍存活，不代表模型有输出进展。
-  const heartbeat = setInterval(() => {
-    void pool
-      .query("UPDATE generation_run SET heartbeat_at=NOW() WHERE id=$1 AND status='running'", [
-        runId,
-      ])
-      .catch(abort)
-  }, 10000)
-  // 跨实例取消通过数据库轮询传播，防止只中止浏览器却持续消耗模型资源。
+      .then((r) => {
+        if (!r.rowCount) {
+          fail(new GenerationFailure('LEASE_LOST'))
+        }
+      })
+      .catch(() => fail(new GenerationFailure('DATABASE_UNAVAILABLE')))
+      .finally(() => {
+        heartbeatBusy = false
+      })
+  }, limits.heartbeatMs)
+  let pollBusy = false
   const poll = setInterval(() => {
     if (pollBusy) {
       return
@@ -262,50 +345,102 @@ export async function execute(
     pollBusy = true
     void pool
       .query(
-        `SELECT r.cancel_requested,r.status,CASE WHEN r.auth_session_id IS NULL THEN true ELSE EXISTS(SELECT 1 FROM session s WHERE s.id=r.auth_session_id AND s.user_id=r.user_id AND s.expires_at>NOW()) END AS session_live FROM generation_run r WHERE r.id=$1`,
+        `SELECT r.cancel_requested,r.status,CASE WHEN r.auth_session_id IS NULL THEN true ELSE
+      EXISTS(SELECT 1 FROM session s WHERE s.id=r.auth_session_id AND s.user_id=r.user_id AND s.expires_at>NOW())
+      END AS session_live FROM generation_run r WHERE r.id=$1`,
         [runId]
       )
       .then((r) => {
-        if (r.rows[0]?.session_live === false) {
-          sessionExpired = true
-          abort()
-        }
-        if (r.rows[0]?.cancel_requested || r.rows[0]?.status !== 'running') {
+        if (!r.rows[0] || r.rows[0].status !== 'running') {
+          fail(new GenerationFailure('LEASE_LOST'))
+        } else if (r.rows[0].session_live === false) {
+          fail(new GenerationFailure('SESSION_EXPIRED'))
+        } else if (r.rows[0].cancel_requested) {
           abort()
         }
       })
-      .catch(abort)
+      .catch(() => fail(new GenerationFailure('DATABASE_UNAVAILABLE')))
       .finally(() => {
         pollBusy = false
       })
-  }, 1500)
+  }, limits.pollMs)
+  let progressTimer: ReturnType<typeof setTimeout> | undefined
+  const progress = () => {
+    if (progressTimer) {
+      clearTimeout(progressTimer)
+    }
+    progressTimer = setTimeout(() => fail(new GenerationFailure('IDLE_TIMEOUT')), limits.idleMs)
+  }
+  const indexes = new Map<number, number>()
+  let lastSnapshot = 0
+  let lastPersist = 0
   try {
-    if (
-      prepared.authSessionId &&
-      !(await sessionIsLive(pool, prepared.userId, prepared.authSessionId))
-    ) {
-      sessionExpired = true
-      abort()
+    if (prepared.authSessionId) {
+      let live: boolean
+      try {
+        live = await sessionIsLive(pool, prepared.userId, prepared.authSessionId)
+      } catch {
+        throw new GenerationFailure('DATABASE_UNAVAILABLE')
+      }
+      if (!live) {
+        throw new GenerationFailure('SESSION_EXPIRED')
+      }
+    }
+    // 预建任务可能在 execute 开始前已被取消/回收，不能再启动一次付费请求。
+    try {
+      const state = await pool.query(
+        'SELECT status,cancel_requested FROM generation_run WHERE id=$1',
+        [runId]
+      )
+      if (!state.rows[0] || state.rows[0].status !== 'running') {
+        throw new GenerationFailure('LEASE_LOST')
+      }
+      if (state.rows[0].cancel_requested) {
+        abort()
+      }
+    } catch (error) {
+      throw error instanceof GenerationFailure
+        ? error
+        : new GenerationFailure('DATABASE_UNAVAILABLE')
     }
     controller.signal.throwIfAborted()
-    await emit('snapshot', { session, runId })
-    const response = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': config.deepseekKey,
-        Accept: 'text/event-stream',
-      },
-      body: JSON.stringify({ ...prepared.body, stream: true }),
-      signal: controller.signal,
-    })
+    await publish('snapshot', { session, runId })
+    const response = await bounded(
+      fetch('https://api.deepseek.com/anthropic/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': config.deepseekKey,
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify({ ...prepared.body, stream: true }),
+        signal: controller.signal,
+      }),
+      limits.connectMs,
+      'CONNECT_TIMEOUT',
+      controller.signal
+    )
     if (!response.ok) {
-      throw new Error(`模型请求失败（HTTP ${response.status}）`)
+      void response.body?.cancel().catch(() => {})
+      throw new GenerationFailure(
+        response.status === 401 || response.status === 403
+          ? 'UPSTREAM_AUTH'
+          : response.status === 429
+            ? 'UPSTREAM_RATE_LIMIT'
+            : 'UPSTREAM_UNAVAILABLE'
+      )
     }
     if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
-      throw new Error('模型未返回有效事件流')
+      throw new GenerationFailure('STREAM_INTERRUPTED')
     }
-    for await (const frame of readServerSentEvents(response.body, controller.signal)) {
+    progress()
+    for await (const frame of readServerSentEvents(
+      boundedResponse(response.body, limits, controller.signal),
+      controller.signal
+    )) {
+      if (frame.event === 'error') {
+        throw new GenerationFailure('UPSTREAM_UNAVAILABLE')
+      }
       let data: unknown
       try {
         data = JSON.parse(frame.data)
@@ -316,7 +451,7 @@ export async function execute(
         frame.event === 'error' ||
         (typeof data === 'object' && data !== null && 'error' in data)
       ) {
-        throw new Error('模型生成过程中返回错误')
+        throw new GenerationFailure('UPSTREAM_UNAVAILABLE')
       }
       const event = readMessageEvent(data)
       if (!event) {
@@ -325,8 +460,33 @@ export async function execute(
       if (event.type === 'message_delta' && event.usage) {
         sawFinalUsage = true
       }
+      if (event.type !== 'ping') {
+        progress()
+      }
       attemptUsage = updateAttemptUsage(attemptUsage, event)
       reply = applyEvent(reply, event, Date.now(), indexes)
+      const refusalEvent = event.type === 'message_delta' && event.delta.stop_reason === 'refusal'
+      if (refusalEvent) {
+        refused = true
+        indexes.clear()
+      }
+      if (refused) {
+        // 拒绝为单向状态，后续异常正文/结束原因不能重新暴露已清理文本。
+        reply = {
+          ...reply,
+          stopReason: 'refusal',
+          blocks: reply.blocks.filter(
+            (block) => block.type !== 'text' && block.type !== 'thinking'
+          ),
+        }
+      }
+      if (refusalEvent) {
+        // 不等待限频窗口或message_stop，立即用拒绝后的内容覆盖最近检查点。
+        await checkpoint()
+        lastPersist = Date.now()
+        await publish('snapshot', { session: current(), runId })
+        lastSnapshot = Date.now()
+      }
       if (event.type === 'message_delta' && event.delta.title && !session.title) {
         session = { ...session, title: event.delta.title }
       }
@@ -334,95 +494,95 @@ export async function execute(
         seenStop = true
         break
       }
-      // UI 快照与持久化分别限频；等待发送处理背压，避免每个 token 都写库。
-      if (Date.now() - lastSnapshot > 80) {
-        await emit('snapshot', { session: current(), runId })
-        lastSnapshot = Date.now()
-      }
       if (Date.now() - lastPersist > 1000) {
         await checkpoint()
         lastPersist = Date.now()
       }
+      if (Date.now() - lastSnapshot > 80) {
+        await publish('snapshot', { session: current(), runId })
+        lastSnapshot = Date.now()
+      }
     }
-    // 连接自然关闭不等于成功，只有供应商结束事件可以确认完整响应。
     if (!seenStop && !controller.signal.aborted) {
-      throw new Error('模型连接提前中断，请重试')
+      throw new GenerationFailure('STREAM_INTERRUPTED')
     }
   } catch (error) {
-    if (!controller.signal.aborted) {
-      errorMessage = error instanceof Error ? error.message : '生成失败'
+    // 只允许固定业务错误进入数据库/UI；pg、网络及任意上游原文均不透传。
+    if (error instanceof GenerationFailure) {
+      failure ??= error
+    } else if (!controller.signal.aborted) {
+      failure ??= new GenerationFailure('STREAM_INTERRUPTED')
     }
+    controller.abort()
   } finally {
+    finishing = true
+    if (progressTimer) {
+      clearTimeout(progressTimer)
+    }
     clearTimeout(timer)
-    clearInterval(poll)
     clearInterval(heartbeat)
+    clearInterval(poll)
     signal.removeEventListener('abort', abort)
     active.delete(runId)
-    if (timedOut && !seenStop) {
-      errorMessage = '生成超过本地开发的 240 秒上限，已保存部分内容'
-    }
-    if (sessionExpired && !seenStop) {
-      errorMessage = '登录已失效，请重新登录'
-    }
-    // 区分正常结束、超时和主动停止；所有路径都保留已得到的部分内容。
-    const status = seenStop
-      ? 'done'
-      : timedOut || sessionExpired
-        ? 'error'
-        : controller.signal.aborted
-          ? 'stopped'
-          : 'error'
-    reply = settleReply(
-      reply,
-      status,
-      Date.now(),
-      errorMessage ? { kind: 'stream', message: errorMessage } : undefined
-    )
-    session = current()
-    // 任务终态、用量和回答在同一事务落库；失败则一起回滚，不误记完成。
-    const usage = normalizeUsage(attemptUsage, seenStop && sawFinalUsage)
     try {
       await inTransaction(async (q) => {
         await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [session.id])
-        const r = await q.query(
-          "UPDATE generation_run SET status=$2,usage=$3,error=$4,finished_at=NOW(),heartbeat_at=NOW() WHERE id=$1 AND status='running' RETURNING id",
-          [runId, status, JSON.stringify(attemptUsage), errorMessage ?? null]
+        // 取消和完成在同一行锁上线性化：先写入取消则停止，已提交完成则后来的取消不改终态。
+        const locked = await q.query(
+          'SELECT status,cancel_requested FROM generation_run WHERE id=$1 FOR UPDATE',
+          [runId]
         )
-        if (r.rowCount) {
-          await q.query(
-            `UPDATE usage_record SET input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
-            raw_usage=$5,completeness=$6,updated_at=NOW() WHERE generation_id=$1`,
-            [
-              runId,
-              usage.input,
-              usage.cached,
-              usage.output,
-              JSON.stringify(usage.raw),
-              usage.completeness,
-            ]
-          )
-          await q.query('UPDATE message SET payload=$2 WHERE id=$1', [
-            reply.id,
-            JSON.stringify(reply),
-          ])
-          const saved = await q.query(
-            "UPDATE conversation SET title=CASE WHEN title='' THEN $2 ELSE title END,updated_at=NOW(),version=version+1 WHERE id=$1 RETURNING version,updated_at",
-            [session.id, session.title]
-          )
-          session.revision = saved.rows[0].version
-          session.updatedAt = saved.rows[0].updated_at.getTime()
+        if (!locked.rows[0] || locked.rows[0].status !== 'running') {
+          throw new GenerationFailure('LEASE_LOST')
         }
+        const cancelled = locked.rows[0].cancel_requested
+        if (cancelled) {
+          failure = undefined
+        }
+        const status = cancelled ? 'stopped' : failure ? 'error' : seenStop ? 'done' : 'stopped'
+        reply = settleReply(
+          reply,
+          status,
+          Date.now(),
+          failure ? { kind: 'stream', message: failure.message } : undefined
+        )
+        session = current()
+        const updated = await q.query(
+          "UPDATE generation_run SET status=$2,usage=$3,error=$4,finished_at=NOW(),heartbeat_at=NOW() WHERE id=$1 AND status='running' RETURNING id",
+          [runId, status, JSON.stringify(attemptUsage), failure?.code ?? null]
+        )
+        if (!updated.rowCount) {
+          throw new GenerationFailure('LEASE_LOST')
+        }
+        await writeUsage(q, status === 'done' && sawFinalUsage)
+        await q.query('UPDATE message SET payload=$2 WHERE id=$1', [
+          reply.id,
+          JSON.stringify(reply),
+        ])
+        const saved = await q.query(
+          "UPDATE conversation SET title=CASE WHEN title='' THEN $2 ELSE title END,updated_at=NOW(),version=version+1 WHERE id=$1 RETURNING version,updated_at",
+          [session.id, session.title]
+        )
+        session.revision = saved.rows[0].version
+        session.updatedAt = saved.rows[0].updated_at.getTime()
       })
-      await emit(errorMessage ? 'error' : 'done', {
-        session,
-        runId,
-        ...(errorMessage ? { message: errorMessage } : {}),
-        ...(sessionExpired ? { code: 'SESSION_EXPIRED' } : {}),
-      }).catch(() => {})
-    } catch {
-      await emit('error', { message: '数据库保存失败，请刷新检查已保存内容', runId }).catch(
-        () => {}
-      )
+      await bounded(
+        emit(failure ? 'error' : 'done', {
+          session,
+          runId,
+          ...(failure ? { code: failure.code, message: failure.message } : {}),
+        }),
+        limits.clientWriteMs,
+        'CLIENT_SLOW'
+      ).catch(() => {})
+    } catch (error) {
+      const safe = error instanceof GenerationFailure ? error : new GenerationFailure('SAVE_FAILED')
+      // 终态事务失败/失去租约不能携未提交session，更不能发done。
+      await bounded(
+        emit('error', { runId, code: safe.code, message: safe.message }),
+        limits.clientWriteMs,
+        'CLIENT_SLOW'
+      ).catch(() => {})
     }
   }
 }

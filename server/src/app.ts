@@ -186,6 +186,9 @@ app.post('/api/conversations/:id/generations', async (c) => {
     .parse(await c.req.json())
   await recoverStale(c.get('userId'))
   const task = await prepare(c.get('userId'), c.req.param('id'), input, c.get('sessionId'))
+  if (task.replay) {
+    return c.json(task)
+  }
   c.header('X-Accel-Buffering', 'no')
   return streamSSE(c, async (stream) => {
     const abort = new AbortController()
@@ -203,20 +206,22 @@ app.post('/api/conversations/:id/generations', async (c) => {
 // 先持久化取消标记，再尝试中止本进程任务；其他实例通过轮询感知。
 app.post('/api/generations/:id/cancel', async (c) => {
   const r = await pool.query(
-    "UPDATE generation_run SET cancel_requested=true WHERE id=$1 AND user_id=$2 AND status='running' RETURNING id",
+    "UPDATE generation_run SET cancel_requested=true WHERE id=$1 AND user_id=$2 AND status='running' RETURNING id,status,cancel_requested",
     [c.req.param('id'), c.get('userId')]
   )
+  let state = r.rows[0]
   if (!r.rowCount) {
-    const exists = await pool.query('SELECT id FROM generation_run WHERE id=$1 AND user_id=$2', [
-      c.req.param('id'),
-      c.get('userId'),
-    ])
+    const exists = await pool.query(
+      'SELECT id,status,cancel_requested FROM generation_run WHERE id=$1 AND user_id=$2',
+      [c.req.param('id'), c.get('userId')]
+    )
     if (!exists.rowCount) {
       throw new HttpError(404, '生成任务不存在')
     }
+    state = exists.rows[0]
   }
   cancelActive(c.req.param('id'))
-  return c.json({ ok: true })
+  return c.json({ ok: true, status: state.status, cancelRequested: state.cancel_requested })
 })
 app.onError((error, c) => {
   if (error instanceof ContextBudgetExceededError) {

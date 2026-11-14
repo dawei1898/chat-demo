@@ -15,9 +15,18 @@ export type ServerSentEvent = {
   lastEventId: string
 }
 
+export type SseLimits = { maxLineChars?: number; maxEventChars?: number }
+
 const LINE_BREAK = /\r\n|\r|\n/g
 
 export class ServerSentEventDecoder {
+  // 字符数阈值限制内存增长；默认兼容较大的会话快照，可由上游适配器收紧。
+  private readonly maxLineChars: number
+  private readonly maxEventChars: number
+  constructor(limits: SseLimits = {}) {
+    this.maxLineChars = limits.maxLineChars ?? 4 * 1024 * 1024
+    this.maxEventChars = limits.maxEventChars ?? 4 * 1024 * 1024
+  }
   private buffer = ''
   private data = ''
   private hasData = false
@@ -42,6 +51,9 @@ export class ServerSentEventDecoder {
       lineStart = LINE_BREAK.lastIndex
     }
     this.buffer = this.buffer.slice(lineStart)
+    if (this.buffer.length > this.maxLineChars) {
+      throw new Error('SSE 单行超过安全长度限制')
+    }
     return events
   }
 
@@ -56,6 +68,9 @@ export class ServerSentEventDecoder {
   }
 
   private processLine(line: string): ServerSentEvent | null {
+    if (line.length > this.maxLineChars) {
+      throw new Error('SSE 单行超过安全长度限制')
+    }
     if (line === '') {
       return this.dispatch()
     }
@@ -70,6 +85,9 @@ export class ServerSentEventDecoder {
     }
     switch (field) {
       case 'data':
+        if (this.data.length + value.length + 1 > this.maxEventChars) {
+          throw new Error('SSE 事件超过安全长度限制')
+        }
         this.data = this.hasData ? `${this.data}\n${value}` : value
         this.hasData = true
         break
@@ -104,8 +122,10 @@ export class ServerSentEventDecoder {
  */
 export async function* readServerSentEvents(
   stream: ReadableStream<Uint8Array>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  limits: SseLimits = {}
 ): AsyncGenerator<ServerSentEvent> {
+  signal?.throwIfAborted()
   const reader = stream.getReader()
   const onAbort = () => {
     reader.cancel(signal?.reason).catch(() => {})
@@ -113,11 +133,12 @@ export async function* readServerSentEvents(
   signal?.addEventListener('abort', onAbort, { once: true })
   // TextDecoder 默认会去掉开头的 BOM；stream: true 保证多字节字符跨分片时不被截断
   const textDecoder = new TextDecoder()
-  const decoder = new ServerSentEventDecoder()
+  const decoder = new ServerSentEventDecoder(limits)
   let finished = false
   try {
     for (;;) {
       const { done, value } = await reader.read()
+      signal?.throwIfAborted()
       if (done) {
         finished = true
         yield* decoder.push(textDecoder.decode())

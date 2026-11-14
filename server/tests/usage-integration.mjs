@@ -32,6 +32,7 @@ try {
     '0001_illegal_quicksilver.sql',
     '0002_spooky_ben_grimm.sql',
     '0003_dusty_puff_adder.sql',
+    '0004_woozy_skrulls.sql',
   ]) {
     const sql = (
       await readFile(new URL('../../migrations/' + name, import.meta.url), 'utf8')
@@ -46,6 +47,7 @@ try {
   await client.query(`INSERT INTO conversation(id,user_id) VALUES('c','u')`)
   const query = async (sql, values) => {
     if (sql === 'BEGIN') {
+      await client.query('SET CONSTRAINTS ALL DEFERRED')
       return client.query('SAVEPOINT app_transaction')
     }
     if (sql === 'COMMIT') {
@@ -120,7 +122,9 @@ try {
   ).rows
   assert.equal(Number(rows[0].output_tokens), 8)
   assert.equal(rows[0].completeness, 'complete')
-  await assert.rejects(() => prepare('u', 'c', input))
+  const replay = await prepare('u', 'c', input)
+  assert.equal(replay.replay, true)
+  assert.equal(replay.runId, first.runId)
   assert.equal(Number((await client.query('SELECT count(*) FROM usage_record')).rows[0].count), 1)
   stage = 'continuation isolation'
   output = 3
@@ -156,7 +160,7 @@ try {
   assert.equal(rows[0].completeness, 'unknown')
   assert.equal(rows[0].output_tokens, null)
   process.stdout.write(
-    'PASS: real prepare/execute ledger, duplicate rejection, isolated continuation usage, atomic failure rollback\n'
+    'PASS: real prepare/execute ledger, idempotent replay, isolated continuation usage, atomic failure rollback\n'
   )
 } catch (e) {
   process.stderr.write(`FAIL stage=${stage} type=${e.name} code=${e.code ?? 'none'}\n`)

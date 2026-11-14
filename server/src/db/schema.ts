@@ -112,6 +112,8 @@ export const generationRun = pgTable(
     // 会话可被撤销或删除，保留审计ID而不建立阻止注销的外键。该值不是会话token。
     authSessionId: text('auth_session_id'),
     idempotencyKey: text('idempotency_key').notNull(),
+    // 请求语义指纹用于同键重试核验；旧记录null不可推断为相同请求，也不回填旧内容。
+    requestHash: text('request_hash'),
     operation: text('operation').notNull(),
     status: text('status').notNull(),
     usage: jsonb('usage'),

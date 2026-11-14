@@ -118,7 +118,7 @@ export async function assertIdle(q: Queryable, id: string) {
 // 心跳超时只认定中断，绝不猜测模型已完成；保留最近落库的部分内容。
 export async function recoverStale(userId: string) {
   const stale = await pool.query(
-    "SELECT id,conversation_id,message_id FROM generation_run WHERE user_id=$1 AND status='running' AND heartbeat_at < NOW()-INTERVAL '60 seconds'",
+    "SELECT id,conversation_id,message_id FROM generation_run WHERE user_id=$1 AND status='running' AND heartbeat_at < NOW()-INTERVAL '60 seconds' ORDER BY heartbeat_at LIMIT 50",
     [userId]
   )
   for (const r of stale.rows) {
@@ -126,7 +126,7 @@ export async function recoverStale(userId: string) {
       await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [r.conversation_id])
       // 在锁内再次检查租约，避免首次查询后心跳恢复却仍被错误回收。
       const update = await q.query(
-        "UPDATE generation_run SET status='interrupted',finished_at=NOW(),error='服务中断' WHERE id=$1 AND status='running' AND heartbeat_at < NOW()-INTERVAL '60 seconds' RETURNING id",
+        "UPDATE generation_run SET status='interrupted',finished_at=NOW(),error='LEASE_EXPIRED' WHERE id=$1 AND status='running' AND heartbeat_at < NOW()-INTERVAL '60 seconds' RETURNING id",
         [r.id]
       )
       if (update.rowCount) {
@@ -134,8 +134,12 @@ export async function recoverStale(userId: string) {
           r.conversation_id,
         ])
         await q.query(
-          `UPDATE message SET payload=jsonb_set(jsonb_set(payload,'{status}','"stopped"'),'{error}','null') WHERE id=$1 AND conversation_id=$2`,
+          `UPDATE message SET payload=jsonb_set(jsonb_set(payload,'{status}','"stopped"'),'{error}','{"kind":"stream","message":"生成服务中断，已恢复最近检查点；不会自动重新调用模型"}') WHERE id=$1 AND conversation_id=$2`,
           [r.message_id, r.conversation_id]
+        )
+        await q.query(
+          "UPDATE usage_record SET completeness=CASE WHEN raw_usage IS NULL OR raw_usage='null'::jsonb THEN 'unknown' ELSE 'partial' END,updated_at=NOW() WHERE generation_id=$1",
+          [r.id]
         )
       }
     })

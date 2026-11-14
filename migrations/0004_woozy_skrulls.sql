@@ -1,0 +1,1 @@
+ALTER TABLE "generation_run" ADD COLUMN "request_hash" text;

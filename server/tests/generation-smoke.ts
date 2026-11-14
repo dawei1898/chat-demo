@@ -77,7 +77,9 @@ try {
     reply?.role === 'assistant' &&
       reply.blocks.some((b) => b.type === 'text' && b.text === '本地流式测试通过')
   )
-  await assert.rejects(() => prepare(userId, id, input))
+  const replay = await prepare(userId, id, input)
+  assert.equal(replay.replay, true)
+  assert.equal(replay.runId, task.runId)
   assert.ok(reply)
   assert.equal(reply.parentId, s.messages.find((m) => m.role === 'user')?.id)
   const again = await prepare(userId, id, {
