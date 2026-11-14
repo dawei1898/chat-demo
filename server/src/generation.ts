@@ -15,6 +15,7 @@ import { readServerSentEvents } from '../../src/services/api/sse.js'
 import { readMessageEvent } from '../../src/services/api/parseEvent.js'
 import type { AssistantMessage, UserMessage, Message } from '../../src/services/chat/types.js'
 import type { CreateMessageRequest } from '../../src/services/api/types.js'
+// 客户端只能提交操作和开关，不能伪造用户归属、历史消息或上游工具参数。
 export const generationInput = z
   .object({
     operation: z.enum(['send', 'edit', 'regenerate', 'continue']),
@@ -27,10 +28,12 @@ export const generationInput = z
   })
   .strict()
 export type GenerationInput = z.infer<typeof generationInput>
+// 进程内索引仅加速取消，正确性仍依赖数据库的取消标记与运行状态。
 const active = new Map<string, AbortController>()
 export function cancelActive(id: string) {
   active.get(id)?.abort()
 }
+/** 短事务内锁定会话、检查幂等和分支、预建回答与账本；不在事务内请求模型。 */
 export async function prepare(userId: string, conversationId: string, input: GenerationInput) {
   if (!config.deepseekKey) {
     throw new HttpError(503, '请在本机 .env 配置新的 DEEPSEEK_API_KEY')
@@ -131,8 +134,8 @@ export async function prepare(userId: string, conversationId: string, input: Gen
     if (question.files.length || history.some((m) => m.role === 'user' && m.files.length)) {
       throw new HttpError(400, '本地第一阶段暂不支持附件会话')
     }
-    // appendBranch assigns parent/selected-child metadata on copied nodes.
-    // Stream from that authoritative node, not the pre-append reply object.
+    // appendBranch 在节点副本上补齐 parent/selectedChild。
+    // 后续流式更新必须使用树内权威节点，避免旧对象覆盖关系元数据。
     const linkedReply = session.messages.find((m) => m.id === reply.id)
     if (!linkedReply || linkedReply.role !== 'assistant') {
       throw new HttpError(500, '生成消息状态异常')
@@ -164,6 +167,7 @@ export async function prepare(userId: string, conversationId: string, input: Gen
     return { session, reply, runId, body, userId }
   })
 }
+/** 事务外消费上游事件，通过短检查点事务保存部分结果，结束时原子结算。 */
 export async function execute(
   prepared: Awaited<ReturnType<typeof prepare>>,
   signal: AbortSignal,
@@ -172,6 +176,7 @@ export async function execute(
   const { runId } = prepared
   let session = prepared.session
   let reply: AssistantMessage = { ...prepared.reply, usage: undefined }
+  // 续写复用回答节点，但本次任务的用量从空值开始，不继承前次账本。
   let attemptUsage: Record<string, unknown> | null = null
   let sawFinalUsage = false
   const controller = new AbortController()
@@ -197,6 +202,7 @@ export async function execute(
     updatedAt: Date.now(),
     messages: session.messages.map((m) => (m.id === reply.id ? reply : m)),
   })
+  // 锁定会话后只更新仍在运行的任务，避免覆盖已完成或已回收的状态。
   const checkpoint = async () => {
     await inTransaction(async (q) => {
       await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [session.id])
@@ -211,6 +217,7 @@ export async function execute(
       await q.query('UPDATE message SET payload=$2 WHERE id=$1', [reply.id, JSON.stringify(reply)])
     })
   }
+  // 心跳表明进程仍存活，不代表模型有输出进展。
   const heartbeat = setInterval(() => {
     void pool
       .query("UPDATE generation_run SET heartbeat_at=NOW() WHERE id=$1 AND status='running'", [
@@ -218,6 +225,7 @@ export async function execute(
       ])
       .catch(abort)
   }, 10000)
+  // 跨实例取消通过数据库轮询传播，防止只中止浏览器却持续消耗模型资源。
   const poll = setInterval(() => {
     if (pollBusy) {
       return
@@ -280,6 +288,7 @@ export async function execute(
         seenStop = true
         break
       }
+      // UI 快照与持久化分别限频；等待发送处理背压，避免每个 token 都写库。
       if (Date.now() - lastSnapshot > 80) {
         await emit('snapshot', { session: current(), runId })
         lastSnapshot = Date.now()
@@ -289,6 +298,7 @@ export async function execute(
         lastPersist = Date.now()
       }
     }
+    // 连接自然关闭不等于成功，只有供应商结束事件可以确认完整响应。
     if (!seenStop && !controller.signal.aborted) {
       throw new Error('模型连接提前中断，请重试')
     }
@@ -305,6 +315,7 @@ export async function execute(
     if (timedOut && !seenStop) {
       errorMessage = '生成超过本地开发的 240 秒上限，已保存部分内容'
     }
+    // 区分正常结束、超时和主动停止；所有路径都保留已得到的部分内容。
     const status = seenStop
       ? 'done'
       : timedOut
@@ -319,6 +330,7 @@ export async function execute(
       errorMessage ? { kind: 'stream', message: errorMessage } : undefined
     )
     session = current()
+    // 任务终态、用量和回答在同一事务落库；失败则一起回滚，不误记完成。
     const usage = normalizeUsage(attemptUsage, seenStop && sawFinalUsage)
     try {
       await inTransaction(async (q) => {

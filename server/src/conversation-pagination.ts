@@ -14,8 +14,8 @@ function isTimestamp(value: unknown): value is string {
   if (typeof value !== 'string' || !timestampPattern.test(value)) {
     return false
   }
-  // PG timestamp is timezone-free; retain all six fractional digits in the cursor.
-  // Date is used only to reject impossible calendar values, never to build the cursor.
+  // PostgreSQL 无时区时间戳保留六位微秒；转成毫秒游标会漏掉同毫秒记录。
+  // Date 只用于拒绝非法日期，不参与游标值生成。
   const milliseconds = value.slice(0, 23) + 'Z'
   const date = new Date(milliseconds)
   return Number.isFinite(date.getTime()) && date.toISOString() === milliseconds
@@ -58,6 +58,7 @@ function decodeCursor(value: string): Cursor {
   }
 }
 
+/** 拒绝重复参数和非法游标，不让不同解析器产生歧义。 */
 export function parseConversationPagination(query: URLSearchParams): ConversationPagination {
   if (query.getAll('limit').length > 1 || query.getAll('cursor').length > 1) {
     throw invalid()
@@ -88,6 +89,7 @@ export async function listConversationPage(
 ): Promise<ConversationPage> {
   const { limit, cursor } = pagination
   const values: (string | number)[] = [userId]
+  // 时间相同时用 ID 稳定排序；所有边界值均作为 SQL 参数绑定。
   let boundary = ''
   if (cursor) {
     values.push(cursor.updatedAt, cursor.id)
@@ -102,6 +104,7 @@ export async function listConversationPage(
      ORDER BY updated_at DESC,id DESC LIMIT $${values.length}`,
     values
   )
+  // 多取一条仅用于判断是否还有下一页，不把探测行返回客户端。
   const rows = result.rows.slice(0, limit)
   const last = rows.at(-1)
   return {

@@ -23,6 +23,7 @@ import { generationInput, prepare, execute, cancelActive } from './generation.js
 import { selectVersion } from '../../src/services/chat/branches.js'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 export const app = new Hono<{ Variables: { userId: string } }>()
+// 请求体上限先于认证与业务解析执行，避免无界读取。
 app.use(
   '/api/*',
   bodyLimit({
@@ -31,6 +32,7 @@ app.use(
   })
 )
 app.use('/api/*', async (c, next) => {
+  // 私有会话不允许中间缓存；写请求必须来自配置的同源前端。
   c.header('Cache-Control', 'no-store')
   if (
     !['GET', 'HEAD', 'OPTIONS'].includes(c.req.method) &&
@@ -41,6 +43,7 @@ app.use('/api/*', async (c, next) => {
   return next()
 })
 app.get('/api/health', (c) => c.json({ ok: true, mode: 'local-development' }))
+// 认证路由先交给 Better Auth；后续业务路由统一要求有效会话。
 app.all('/api/auth/*', (c) => auth.handler(c.req.raw))
 app.use('/api/*', async (c, next) => {
   const session = await auth.api.getSession({ headers: c.req.raw.headers })
@@ -57,7 +60,7 @@ app.get('/api/conversations', async (c) => {
   await recoverStale(c.get('userId'))
   const page = await listConversationPage(pool, c.get('userId'),
     legacy ? { limit: 200, cursor: null } : pagination)
-  // Keep the existing UI contract until paginated navigation is integrated.
+  // 分页导航尚未接入前端：无分页参数保留旧数组契约，显式参数返回分页对象。
   return c.json(legacy ? page.items : page)
 })
 app.post('/api/conversations', async (c) => {
@@ -103,6 +106,7 @@ app.patch('/api/conversations/:id', async (c) => {
   })
   return c.json(session)
 })
+// 用户删除会话只做软删；生成中的会话必须先停止，避免并发写入。
 app.delete('/api/conversations/:id', async (c) => {
   await inTransaction(async (q) => {
     const s = await loadSession(q, c.get('userId'), c.req.param('id'), true)
@@ -124,6 +128,7 @@ app.post('/api/conversations/:id/generations', async (c) => {
     })
   })
 })
+// 先持久化取消标记，再尝试中止本进程任务；其他实例通过轮询感知。
 app.post('/api/generations/:id/cancel', async (c) => {
   const r = await pool.query(
     "UPDATE generation_run SET cancel_requested=true WHERE id=$1 AND user_id=$2 AND status='running' RETURNING id",
@@ -151,7 +156,7 @@ app.onError((error, c) => {
   if (error instanceof HttpError) {
     return c.json({ error: { message: error.message } }, error.status as ContentfulStatusCode)
   }
-  // Never log request headers, credentials, connection URLs or upstream bodies.
+  // 日志不记录请求头、凭据、连接串或上游正文，只保留错误类型。
   process.stderr.write(`API request failed: ${error.name}\n`)
   return c.json({ error: { message: '服务暂时不可用，请稍后重试' } }, 500)
 })

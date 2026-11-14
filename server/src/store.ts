@@ -11,6 +11,7 @@ export class HttpError extends Error {
   }
 }
 export type Queryable = Pick<PoolClient, 'query'>
+/** 仅包裹短数据库操作；异常统一回滚，连接始终归还池中。 */
 export async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
   const client = await pool.connect()
   try {
@@ -25,6 +26,7 @@ export async function inTransaction<T>(fn: (client: PoolClient) => Promise<T>): 
     client.release()
   }
 }
+/** 先核验用户归属和软删状态，再加载整棵消息树；写操作可锁定会话行。 */
 export async function loadSession(
   q: Queryable,
   userId: string,
@@ -52,6 +54,7 @@ export async function loadSession(
     messages: messages.rows.map((r) => r.payload as Message),
   }
 }
+/** 应在事务中调用：先校验完整树，再原子保存关系字段和展示用 payload。 */
 export async function saveSession(q: Queryable, s: Session): Promise<void> {
   assertMessageTree(s)
   await q.query(
@@ -71,6 +74,7 @@ export async function saveSession(q: Queryable, s: Session): Promise<void> {
         new Date(m.createdAt),
       ]
     )
+    // 全局消息 ID 冲突不能静默吞掉，否则会形成不完整的会话树。
     if (written.rowCount !== 1) {
       throw new HttpError(409, '消息标识已被其他会话使用')
     }
@@ -85,7 +89,7 @@ export async function assertIdle(q: Queryable, id: string) {
     throw new HttpError(409, '此会话正在生成，请先停止或稍后重试')
   }
 }
-// Crash recovery never guesses success. Partial durable content is retained.
+// 心跳超时只认定中断，绝不猜测模型已完成；保留最近落库的部分内容。
 export async function recoverStale(userId: string) {
   const stale = await pool.query(
     "SELECT id,conversation_id,message_id FROM generation_run WHERE user_id=$1 AND status='running' AND heartbeat_at < NOW()-INTERVAL '60 seconds'",
@@ -94,6 +98,7 @@ export async function recoverStale(userId: string) {
   for (const r of stale.rows) {
     await inTransaction(async (q) => {
       await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [r.conversation_id])
+      // 在锁内再次检查租约，避免首次查询后心跳恢复却仍被错误回收。
       const update = await q.query(
         "UPDATE generation_run SET status='interrupted',finished_at=NOW(),error='服务中断' WHERE id=$1 AND status='running' AND heartbeat_at < NOW()-INTERVAL '60 seconds' RETURNING id",
         [r.id]

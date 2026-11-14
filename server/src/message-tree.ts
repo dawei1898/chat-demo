@@ -2,7 +2,7 @@ import type { Session } from '../../src/services/chat/types.js'
 
 export class MessageTreeIntegrityError extends Error {}
 
-/** Validate the complete tree, including currently unselected branches, before any write. */
+/** 写入前验证整棵消息树，未选中的历史分支也必须满足完整性约束。 */
 export function assertMessageTree(session: Session): void {
   const fail = (reason: string): never => {
     throw new MessageTreeIntegrityError(`Invalid message tree: ${reason}`)
@@ -40,7 +40,7 @@ export function assertMessageTree(session: Session): void {
       }
     }
   }
-  // Walk each ancestry once. No recursion, so a long valid history cannot overflow the stack.
+  // 迭代遍历祖先链并复用已完成节点，避免长历史递归导致栈溢出。
   const completed = new Set<string>()
   for (const node of nodes.values()) {
     const path = new Set<string>()

@@ -1,4 +1,5 @@
 import 'dotenv/config'
+// 配置只在后端读取；不得通过构建变量注入浏览器，也不要将此对象写入日志。
 export const config = {
   origin: process.env.BETTER_AUTH_URL || 'http://localhost:8095',
   databaseUrl: process.env.DATABASE_URL || '',
@@ -11,6 +12,7 @@ export function validateConfig() {
   if (!config.databaseUrl || config.secret.length < 32) {
     throw new Error('Configure DATABASE_URL and a 32+ character BETTER_AUTH_SECRET in .env')
   }
+  // 当前切片尚未完成公网安全与平台生命周期验证，显式阻止误部署生产。
   if (process.env.NODE_ENV === 'production') {
     throw new Error('This local development implementation is not yet approved for production')
   }

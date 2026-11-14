@@ -12,6 +12,7 @@ import {
   index,
 } from 'drizzle-orm/pg-core'
 import type { Message } from '../../../src/services/chat/types.js'
+// 认证表由 Better Auth 使用；业务数据清理不得连带删除账号和登录状态。
 export const user = pgTable('user', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
@@ -58,6 +59,7 @@ export const verification = pgTable('verification', {
   createdAt: timestamp('created_at').notNull().defaultNow(),
   updatedAt: timestamp('updated_at').notNull().defaultNow(),
 })
+// 会话保存归属、选中根节点与版本；deletedAt 是业务软删标记。
 export const conversation = pgTable(
   'conversation',
   {
@@ -77,6 +79,7 @@ export const conversation = pgTable(
     uniqueIndex('conversation_id_owner').on(t.id, t.userId),
   ]
 )
+// 关系列用于数据库约束，payload 保留完整展示协议；两者必须同步写入。
 export const message = pgTable(
   'message',
   {
@@ -94,6 +97,7 @@ export const message = pgTable(
     uniqueIndex('message_id_conversation').on(t.id, t.conversationId),
   ]
 )
+// 一次生成对应独立任务；幂等键与活动任务索引共同防止重复生成。
 export const generationRun = pgTable(
   'generation_run',
   {
@@ -124,10 +128,10 @@ export const generationRun = pgTable(
   ]
 )
 
-// Deferred composite FKs, payload checks, and graph constraint triggers are maintained in
-// migrations/0001_* SQL because Drizzle cannot express deferred constraint triggers.
-// Use versioned migrations, not drizzle-kit push, when changing these tables.
+// 延迟复合外键、payload 检查及消息树触发器由 migrations/0001_* SQL 维护。
+// Drizzle 无法完整表达这些延迟约束；修改表结构必须走版本化迁移，不能用 push 替代。
 
+// 每次任务独立记账；未知 token 不补零，续写不能重复累计上一任务用量。
 export const usageRecord = pgTable('usage_record', {
   generationId: text('generation_id').primaryKey().references(() => generationRun.id),
   inputTokens: bigint('input_tokens', { mode: 'number' }),
