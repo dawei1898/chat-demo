@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import { pool } from './db/client.js'
+import { assertMessageTree } from './message-tree.js'
 import type { Session, Message } from '../../src/services/chat/types.js'
 export class HttpError extends Error {
   constructor(
@@ -52,12 +53,13 @@ export async function loadSession(
   }
 }
 export async function saveSession(q: Queryable, s: Session): Promise<void> {
+  assertMessageTree(s)
   await q.query(
     'UPDATE conversation SET title=$2,root_message_id=$3,updated_at=$4,version=version+1 WHERE id=$1',
     [s.id, s.title, s.rootMessageId ?? null, new Date(s.updatedAt)]
   )
   for (const m of s.messages) {
-    await q.query(
+    const written = await q.query(
       `INSERT INTO message(id,conversation_id,parent_id,selected_child_id,payload,created_at) VALUES($1,$2,$3,$4,$5,$6)
     ON CONFLICT(id) DO UPDATE SET parent_id=excluded.parent_id,selected_child_id=excluded.selected_child_id,payload=excluded.payload WHERE message.conversation_id=excluded.conversation_id`,
       [
@@ -69,6 +71,9 @@ export async function saveSession(q: Queryable, s: Session): Promise<void> {
         new Date(m.createdAt),
       ]
     )
+    if (written.rowCount !== 1) {
+      throw new HttpError(409, '消息标识已被其他会话使用')
+    }
   }
 }
 export async function assertIdle(q: Queryable, id: string) {

@@ -1,3 +1,4 @@
+import { updateAttemptUsage, normalizeUsage } from './usage.js'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { pool } from './db/client.js'
@@ -144,6 +145,7 @@ export async function prepare(userId: string, conversationId: string, input: Gen
       "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status) VALUES($1,$2,$3,$4,$5,$6,'running')",
       [runId, userId, conversationId, reply.id, input.idempotencyKey, input.operation]
     )
+    await q.query('INSERT INTO usage_record(generation_id) VALUES($1)', [runId])
     const body: CreateMessageRequest & { max_tokens: number } = {
       model: 'deepseek-flash',
       max_tokens: config.maxTokens,
@@ -169,7 +171,9 @@ export async function execute(
 ) {
   const { runId } = prepared
   let session = prepared.session
-  let reply = prepared.reply
+  let reply: AssistantMessage = { ...prepared.reply, usage: undefined }
+  let attemptUsage: Record<string, unknown> | null = null
+  let sawFinalUsage = false
   const controller = new AbortController()
   active.set(runId, controller)
   const abort = () => controller.abort()
@@ -266,6 +270,8 @@ export async function execute(
       if (!event) {
         continue
       }
+      if (event.type === 'message_delta' && event.usage) { sawFinalUsage = true }
+      attemptUsage = updateAttemptUsage(attemptUsage, event)
       reply = applyEvent(reply, event, Date.now(), indexes)
       if (event.type === 'message_delta' && event.delta.title && !session.title) {
         session = { ...session, title: event.delta.title }
@@ -313,14 +319,18 @@ export async function execute(
       errorMessage ? { kind: 'stream', message: errorMessage } : undefined
     )
     session = current()
+    const usage = normalizeUsage(attemptUsage, seenStop && sawFinalUsage)
     try {
       await inTransaction(async (q) => {
         await q.query('SELECT id FROM conversation WHERE id=$1 FOR UPDATE', [session.id])
         const r = await q.query(
           "UPDATE generation_run SET status=$2,usage=$3,error=$4,finished_at=NOW(),heartbeat_at=NOW() WHERE id=$1 AND status='running' RETURNING id",
-          [runId, status, JSON.stringify(reply.usage ?? null), errorMessage ?? null]
+          [runId, status, JSON.stringify(attemptUsage), errorMessage ?? null]
         )
         if (r.rowCount) {
+          await q.query(`UPDATE usage_record SET input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
+            raw_usage=$5,completeness=$6,updated_at=NOW() WHERE generation_id=$1`,
+            [runId, usage.input, usage.cached, usage.output, JSON.stringify(usage.raw), usage.completeness])
           await q.query('UPDATE message SET payload=$2 WHERE id=$1', [
             reply.id,
             JSON.stringify(reply),

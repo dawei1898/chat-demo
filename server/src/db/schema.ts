@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm'
 import {
   pgTable,
   text,
@@ -5,6 +6,8 @@ import {
   boolean,
   jsonb,
   integer,
+  bigint,
+  check,
   uniqueIndex,
   index,
 } from 'drizzle-orm/pg-core'
@@ -69,7 +72,10 @@ export const conversation = pgTable(
     updatedAt: timestamp('updated_at').notNull().defaultNow(),
     deletedAt: timestamp('deleted_at'),
   },
-  (t) => [index('conversation_user_updated').on(t.userId, t.updatedAt)]
+  (t) => [
+    index('conversation_user_updated').on(t.userId, t.updatedAt),
+    uniqueIndex('conversation_id_owner').on(t.id, t.userId),
+  ]
 )
 export const message = pgTable(
   'message',
@@ -83,7 +89,10 @@ export const message = pgTable(
     payload: jsonb('payload').$type<Message>().notNull(),
     createdAt: timestamp('created_at').notNull().defaultNow(),
   },
-  (t) => [index('message_conversation_created').on(t.conversationId, t.createdAt)]
+  (t) => [
+    index('message_conversation_created').on(t.conversationId, t.createdAt),
+    uniqueIndex('message_id_conversation').on(t.id, t.conversationId),
+  ]
 )
 export const generationRun = pgTable(
   'generation_run',
@@ -109,5 +118,26 @@ export const generationRun = pgTable(
   (t) => [
     uniqueIndex('generation_user_idempotency').on(t.userId, t.idempotencyKey),
     index('generation_conversation').on(t.conversationId),
+    uniqueIndex('generation_one_running_per_conversation')
+      .on(t.conversationId)
+      .where(sql`${t.status} = 'running'`),
   ]
 )
+
+// Deferred composite FKs, payload checks, and graph constraint triggers are maintained in
+// migrations/0001_* SQL because Drizzle cannot express deferred constraint triggers.
+// Use versioned migrations, not drizzle-kit push, when changing these tables.
+
+export const usageRecord = pgTable('usage_record', {
+  generationId: text('generation_id').primaryKey().references(() => generationRun.id),
+  inputTokens: bigint('input_tokens', { mode: 'number' }),
+  cachedInputTokens: bigint('cached_input_tokens', { mode: 'number' }),
+  outputTokens: bigint('output_tokens', { mode: 'number' }),
+  rawUsage: jsonb('raw_usage'),
+  completeness: text('completeness').notNull().default('unknown'),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+  updatedAt: timestamp('updated_at').notNull().defaultNow(),
+}, (t) => [
+  check('usage_counts_nonnegative', sql`${t.inputTokens} >= 0 AND ${t.cachedInputTokens} >= 0 AND ${t.outputTokens} >= 0`),
+  check('usage_completeness_valid', sql`${t.completeness} IN ('unknown','partial','complete')`),
+])
