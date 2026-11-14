@@ -1,3 +1,4 @@
+import { safeExternalUrl } from '../../utils/safeExternalUrl.js'
 import clsx from 'clsx'
 import type { Source } from '../../services/chat/view.js'
 import { formatDate } from '../../utils/format.js'
@@ -14,7 +15,12 @@ const formatPublishedAt = (value: string | null) => (value ? (formatDate(value, 
 export const SourceCard = ({ source, className }: { source: Source; className?: string }) => {
   const date = formatPublishedAt(source.publishedAt)
   return (
-    <a className={styles.anchor} href={source.url} target="_blank" rel="noreferrer">
+    <a
+      className={styles.anchor}
+      href={safeExternalUrl(source.url)}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
       <div className={clsx(styles.card, className)}>
         <div className={styles.meta}>
           <SiteLogo url={source.siteIcon} className={styles.siteIcon} />

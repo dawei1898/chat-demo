@@ -1,3 +1,4 @@
+import { safeExternalUrl } from '../../utils/safeExternalUrl.js'
 import type { CSSProperties } from 'react'
 import clsx from 'clsx'
 import { FallbackImage } from './FallbackImage.js'
@@ -17,7 +18,7 @@ export const SiteLogo = ({
 }) => (
   <FallbackImage
     key={url ?? ''}
-    src={url ?? ''}
+    src={safeExternalUrl(url) ?? ''}
     fallback={<IconLinkOutline14 />}
     className={clsx(styles.logo, className)}
     imgClassName={styles.img}

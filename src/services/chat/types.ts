@@ -9,13 +9,12 @@ import type {
   TextCitation,
 } from '../api/types.js'
 
-/**
- * 消息附件。id 是本地标识（IndexedDB files 表的主键，原件按它存储，所有引用同一 id 的消息共用一份），
- * 导入的附件沿用导出产物里的文件 ID；本地没有原件的附件只展示文件名，不进入请求。
- * serverId 是 Files API 返回的 file_id，导入的数据或尚未上传成功的文件为 null，发送前补传。
- */
+/** 消息附件元数据。浏览器仅引用业务 attachmentId，不取得供应商凭据或原件下载地址。 */
 export type FileAttachment = {
+  /** 后端授权校验的业务附件ID；旧类型字段只供兼容，不用于读取旧数据。 */
+  attachmentId?: string
   id: string
+  /** 供应商ID仅后端内部使用，浏览器DTO应为null。 */
   serverId: string | null
   name: string
   size: number

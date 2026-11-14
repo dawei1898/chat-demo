@@ -78,7 +78,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
     if (files.length === 0 || useChatStore.getState().importingHistory || !ensureApiKey()) {
       return
     }
-    const error = addDraftFiles(sessionId, files, useSettings.getState().apiKey ?? '')
+    const error = addDraftFiles(sessionId, files, '')
     if (error) {
       showToast(error)
     }
@@ -86,7 +86,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const retryFile = useCallback(
     (id: string) => {
       if (!useChatStore.getState().importingHistory && ensureApiKey()) {
-        retryDraftAttachment(sessionId, id, useSettings.getState().apiKey ?? '')
+        retryDraftAttachment(sessionId, id, '')
       }
     },
     [sessionId]
@@ -245,7 +245,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             size="m"
             tone="primary"
             icon={<IconPaperclipOutline16 />}
-            tooltip={t('uploadFile')}
+            tooltip="上传到 DeepSeek：单文件8 MiB，每消息最多10个；原件无法下载，请自行保留"
             disabled={importingHistory}
             onClick={() => ensureApiKey() && fileInputRef.current?.click()}
           />

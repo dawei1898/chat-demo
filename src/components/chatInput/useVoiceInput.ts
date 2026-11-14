@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { TranslationMessage } from '../../i18n/index.js'
 import { transcribe } from '../../services/api/speech.js'
 import { startRecording, type Recording } from '../../services/speech/recorder.js'
-import { useSettings } from '../../services/settings.js'
+import { createSpeechScope } from '../../services/speech/sessionScope.js'
 import { showToast } from '../base/toastState.js'
 
 export type VoiceInputStatus = 'idle' | 'recording' | 'transcribing'
@@ -36,11 +36,15 @@ export const useVoiceInput = (onText: (text: string) => void) => {
   const recordingRef = useRef<Recording | null>(null)
   const controllerRef = useRef<AbortController | null>(null)
   const operationRef = useRef(0)
+  const scopeRef = useRef<ReturnType<typeof createSpeechScope> | null>(null)
   const onTextRef = useRef(onText)
   onTextRef.current = onText
 
   const cancelOperation = useCallback(() => {
     operationRef.current++
+    const scope = scopeRef.current
+    scopeRef.current = null
+    scope?.cancel(false)
     recordingRef.current?.cancel()
     recordingRef.current = null
     controllerRef.current?.abort()
@@ -60,7 +64,7 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       return
     }
     const operation = operationRef.current
-    recordingRef.current = null
+    const scope = scopeRef.current
     let controller: AbortController | null = null
     try {
       let audio: Blob | null
@@ -69,14 +73,14 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       } finally {
         recording.cancel()
       }
-      if (operationRef.current !== operation || !audio) {
+      if (operationRef.current !== operation || !scope?.isCurrent() || !audio) {
         return
       }
       controller = new AbortController()
       controllerRef.current = controller
       setStatus('transcribing')
-      const text = await transcribe(useSettings.getState().apiKey ?? '', audio, controller.signal)
-      if (controller.signal.aborted || operationRef.current !== operation) {
+      const text = await transcribe('', audio, controller.signal)
+      if (controller.signal.aborted || operationRef.current !== operation || !scope?.isCurrent()) {
         return
       }
       if (text.trim()) {
@@ -90,8 +94,7 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       }
     } finally {
       if (operationRef.current === operation) {
-        controllerRef.current = null
-        setStatus('idle')
+        cancel()
       }
     }
   }, [cancel])
@@ -109,6 +112,8 @@ export const useVoiceInput = (onText: (text: string) => void) => {
       return
     }
     const operation = ++operationRef.current
+    const scope = createSpeechScope(cancel)
+    scopeRef.current = scope
     setStatus('recording')
     try {
       const recording = await startRecording(() => {
@@ -117,14 +122,14 @@ export const useVoiceInput = (onText: (text: string) => void) => {
           void finish()
         }
       })
-      if (operationRef.current !== operation) {
+      if (operationRef.current !== operation || !scope.isCurrent()) {
         recording.cancel()
         return
       }
       recordingRef.current = recording
     } catch (error) {
       if (operationRef.current === operation) {
-        setStatus('idle')
+        cancel()
         showToast(describeRecordingError(error))
       }
     }

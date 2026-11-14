@@ -86,10 +86,10 @@ export const uploadFile = async (
   void _file
   void _purpose
   void _signal
-  throw new ApiError('http', '本地后端首版暂不支持附件上传', 501)
+  throw new ApiError('http', '旧版浏览器直传已禁用，请使用业务附件上传接口', 501)
 }
 export const deleteFile = async (_apiKey: string, _fileId: string): Promise<void> => {
   void _apiKey
   void _fileId
-  throw new ApiError('http', '本地后端首版暂不支持附件管理', 501)
+  throw new ApiError('http', '旧版供应商文件管理已禁用，请使用业务附件管理接口', 501)
 }

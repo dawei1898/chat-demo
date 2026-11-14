@@ -7,10 +7,18 @@ import {
 } from '../auth/sessionBoundary.js'
 import { create } from 'zustand'
 import { showToast } from '../../components/base/toastState.js'
+import { useUploads, resolveMimeType } from '../attachments.js'
+import { retainAttachmentPreview, releaseConversationPreviews } from '../attachmentPreviews.js'
 import { useSettings } from '../settings.js'
 import { readServerSentEvents } from '../api/sse.js'
 import { getVisibleMessages } from './branches.js'
-import { clearAllDrafts, clearSentDraft, getDraft } from './drafts.js'
+import {
+  clearAllDrafts,
+  clearSentDraft,
+  getDraft,
+  prepareDraftMessage,
+  moveDraft,
+} from './drafts.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 type ChatState = {
@@ -293,6 +301,7 @@ export async function removeSession(id: string) {
       body: JSON.stringify({ expectedRevision: revisionOf(id) }),
     })
     assertCurrentSession(epoch)
+    releaseConversationPreviews(id)
     set((s) => ({
       sessions: s.sessions.filter((x) => x.id !== id),
       sessionCache: Object.fromEntries(
@@ -339,12 +348,17 @@ export async function replaceHistory(_write: () => Promise<void>): Promise<numbe
 }
 
 type GenerationInput = {
+  attachmentIds?: string[]
   operation: 'send' | 'edit' | 'regenerate' | 'continue'
   content?: string
   messageId?: string
   parentId?: string | null
 }
-async function generate(id: string, input: GenerationInput) {
+async function generate(
+  id: string,
+  input: GenerationInput,
+  onAccepted?: (session: Session) => void
+) {
   const epoch = sessionEpoch()
   if (get().streaming[id]) {
     return
@@ -409,6 +423,9 @@ async function generate(id: string, input: GenerationInput) {
       }
       if (data.session) {
         put(data.session)
+        if (data.session.id === id) {
+          onAccepted?.(data.session)
+        }
       }
       if (frame.event === 'error') {
         if (data.code === 'SESSION_EXPIRED') {
@@ -460,29 +477,60 @@ export function sendMessage(id: string | null) {
     return false
   }
   const draft = getDraft(id)
-  const content = draft.text.trim()
-  if (!content) {
+  const prepared = prepareDraftMessage(draft, useUploads.getState().tasks)
+  if (!prepared) {
     return false
   }
-  if (draft.attachments.length) {
-    notify(new Error('本地后端首版暂不支持附件'))
-    return false
-  }
+  const content = prepared.text
+  const attachmentIds = prepared.files.map((file) => file.attachmentId)
   const epoch = sessionEpoch()
   creating = true
   void (async () => {
     try {
       let target = id
+      let draftId = id
       if (!target) {
         const session = await api<Session>('/conversations', { method: 'POST', body: '{}' })
         assertCurrentSession(epoch)
         put(session)
         target = session.id
+        moveDraft(id, target)
+        draftId = target
         set({ activeId: target })
       }
       const parentId = getVisibleMessages(get().sessionCache[target]).at(-1)?.id ?? null
-      clearSentDraft(id)
-      await generate(target, { operation: 'send', content, parentId })
+      const previousIds = new Set(get().sessionCache[target]?.messages.map((message) => message.id))
+      let accepted = false
+      await generate(target, { operation: 'send', content, parentId, attachmentIds }, (session) => {
+        // HTTP拒绝、断网或仅返回任务标识都不足以释放已上传原件；必须看见本次新消息。
+        const submitted = session.messages.some(
+          (message) =>
+            message.role === 'user' &&
+            !previousIds.has(message.id) &&
+            message.content === content &&
+            (message.parentId ?? null) === parentId &&
+            message.files.length === attachmentIds.length &&
+            message.files.every((file) => attachmentIds.includes(file.attachmentId ?? file.id))
+        )
+        if (!accepted && submitted) {
+          accepted = true
+          // 服务端确认接收后为消息保留独立URL，草稿URL仍按自己的生命周期释放。
+          draft.attachments.forEach((attachment, index) => {
+            const attachmentId = attachmentIds[index]
+            if (attachment.isImage && attachmentId) {
+              retainAttachmentPreview(
+                attachmentId,
+                session.id,
+                new Blob([attachment.file], { type: resolveMimeType(attachment.file) })
+              )
+            }
+          })
+          // 等待期间新输入的内容仍属于用户，不能被旧请求回调清掉。
+          if (getDraft(draftId) === draft) {
+            clearSentDraft(draftId)
+          }
+        }
+      })
     } catch (e) {
       notify(e)
     } finally {
@@ -516,5 +564,7 @@ export const continueReply = (id: string, messageId: string) => {
 export const retryUpload = (_id: string, _messageId: string) => {
   void _id
   void _messageId
-  notify(new Error('附件暂未开放'))
+  notify(
+    new Error('当前仅保留附件信息，无法下载或补传原件；请先核对上传状态，勿重复上传未知结果的文件')
+  )
 }

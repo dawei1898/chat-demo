@@ -1,7 +1,7 @@
 import clsx from 'clsx'
 import { memo } from 'react'
 import { useTranslate } from '../../i18n/index.js'
-import { useUploads, type UploadTask } from '../../services/attachments.js'
+import { useUploads, reconcileAttachment, type UploadTask } from '../../services/attachments.js'
 import type { DraftAttachment } from '../../services/chat/drafts.js'
 import { IconCloseFill14, IconRefreshOutline16 } from '../base/icons.js'
 import { Tooltip } from '../base/Tooltip.js'
@@ -50,11 +50,26 @@ const AttachmentItem = ({
   const t = useTranslate()
   const task = useUploads((state) => state.tasks[item.id] ?? UPLOADING)
   const status = task.status
-  const error = task.status === 'error' ? t(task.error.key, task.error.params) : undefined
+  const error =
+    task.status === 'error'
+      ? typeof task.error === 'string'
+        ? task.error
+        : t(task.error.key, task.error.params)
+      : undefined
   // 过大、格式不支持等重试无效的失败只提示原因，需删除后再发送
-  const retry = task.status === 'error' && task.retryable ? onRetry : undefined
+  const checking = task.status === 'error' && !task.retryable
+  const retry =
+    task.status === 'error'
+      ? task.retryable
+        ? onRetry
+        : () => {
+            void reconcileAttachment(item.id).catch(() => {})
+          }
+      : undefined
   const failed = status === 'error'
-  const retryLabel = t('uploadRetry', { message: error ?? t('uploadFileStatusFailed') })
+  const retryLabel = checking
+    ? '核对上传结果，不重新上传'
+    : t('uploadRetry', { message: error ?? t('uploadFileStatusFailed') })
   // 「上传失败」只显示重试图标，其余原因写在图片上：可重试时在图标下方，不可重试时贴底
   const showReason = failed && error !== undefined && error !== t('uploadFileStatusFailed')
   return item.previewUrl ? (
@@ -80,7 +95,8 @@ const AttachmentItem = ({
       <button
         type="button"
         className={clsx(styles.remove, failed && !retry && styles.invalidRemove)}
-        aria-label={t('delete')}
+        aria-label="从草稿移除，不删除供应商文件"
+        title="从草稿移除，不删除供应商文件"
         onClick={onRemove}
       >
         <IconCloseFill14 />
@@ -93,7 +109,9 @@ const AttachmentItem = ({
       status={status}
       error={error}
       onRetry={retry}
+      retryLabel={checking ? retryLabel : undefined}
       onRemove={onRemove}
+      removeLabel="从草稿移除，不删除供应商文件"
     />
   )
 }

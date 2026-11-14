@@ -185,8 +185,7 @@ export const canContinueReply = (reply: AssistantMessage): boolean => {
     return false
   }
   return (
-    reply.status === 'stopped' ||
-    (reply.status === 'done' && reply.stopReason === 'max_tokens')
+    reply.status === 'stopped' || (reply.status === 'done' && reply.stopReason === 'max_tokens')
   )
 }
 
@@ -226,17 +225,45 @@ const toAssistantParam = (
   thinking = false
 ): Extract<MessageParam, { role: 'assistant' }> => {
   const content: AssistantBlockParam[] = []
-  // 成功阅读的网页靠签名恢复正文；缺少有效签名时，调用与结果都不回传。
-  const unsignedReadLinks = new Set(
-    blocks.flatMap((block) =>
-      block.type === 'web_fetch_tool_result' &&
-      block.kind === 'read_link' &&
-      block.content.type === 'web_fetch_result' &&
-      !block.signature?.trim()
-        ? [block.tool_use_id]
-        : []
-    )
-  )
+  // 只回传唯一、按顺序配对的 read_link 调用/结果。断流留下的孤立调用不能污染后续上下文。
+  // 成功结果靠签名恢复网页；工具失败结果可无签名，仍保留完整错误对。
+  const validReadLinks = new Set<string>()
+  const calls = blocks.filter((block) => block.type === 'server_tool_use')
+  const results = blocks.filter((block) => block.type === 'web_fetch_tool_result')
+  const positions = new Map(blocks.map((block, index) => [block, index]))
+  const callCounts = new Map<string, number>()
+  const resultGroups = new Map<string, typeof results>()
+  for (const call of calls) {
+    callCounts.set(call.id, (callCounts.get(call.id) ?? 0) + 1)
+  }
+  for (const result of results) {
+    const group = resultGroups.get(result.tool_use_id) ?? []
+    group.push(result)
+    resultGroups.set(result.tool_use_id, group)
+  }
+  for (const call of calls) {
+    if (
+      call.kind !== 'read_link' ||
+      call.name !== 'deepseek_read_url' ||
+      call.input.action !== 'read_link'
+    ) {
+      continue
+    }
+    const matches = resultGroups.get(call.id) ?? []
+    if (callCounts.get(call.id) !== 1 || matches.length !== 1) {
+      continue
+    }
+    const result = matches[0]
+    if (
+      result.kind !== 'read_link' ||
+      (positions.get(result) ?? -1) < (positions.get(call) ?? -1)
+    ) {
+      continue
+    }
+    if (result.content.type === 'web_fetch_tool_result_error' || result.signature?.trim()) {
+      validReadLinks.add(call.id)
+    }
+  }
   /** 正在拼接的文本块；遇到任何非文本块（含不回传的思考块）就结束 */
   let text: TextBlockParam | null = null
   for (const block of blocks) {
@@ -265,14 +292,14 @@ const toAssistantParam = (
     } else if (
       block.type === 'server_tool_use' &&
       block.kind === 'read_link' &&
-      !unsignedReadLinks.has(block.id)
+      validReadLinks.has(block.id)
     ) {
       const { type, id, name, input, kind } = block
       content.push({ type, id, name, input, kind })
     } else if (
       block.type === 'web_fetch_tool_result' &&
       block.kind === 'read_link' &&
-      !unsignedReadLinks.has(block.tool_use_id)
+      validReadLinks.has(block.tool_use_id)
     ) {
       content.push(block)
     }

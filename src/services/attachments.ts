@@ -1,21 +1,49 @@
 import { create } from 'zustand'
 import type { LinkedMessage, TranslationMessage } from '../i18n/index.js'
-import { uploadFile } from './api/client.js'
-import { classifyApiError, getUploadErrorInfo, isRetryableApiError } from './api/errors.js'
+import {
+  uploadBusinessAttachment,
+  reconcileBusinessAttachment,
+  AttachmentError,
+} from './api/attachments.js'
+import {
+  sessionEpoch,
+  isCurrentSession,
+  assertCurrentSession,
+  onSessionInvalidated,
+} from './auth/sessionBoundary.js'
+import { classifyApiError, getUploadErrorInfo } from './api/errors.js'
 import type { FilePurpose } from './api/types.js'
-import { ACCEPT_FILE_EXTS } from './uploadExts.js'
 
-/** 允许上传的扩展名，按扩展名白名单过滤，清单见 uploadExts.ts */
-export const ACCEPTED_EXTS = ACCEPT_FILE_EXTS
+/** 当前业务后端的小白名单；文件真实格式与UTF-8编码仍由后端核验 */
+export const ACCEPTED_EXTS = [
+  'png',
+  'jpg',
+  'jpeg',
+  'gif',
+  'webp',
+  'pdf',
+  'txt',
+  'md',
+  'csv',
+  'json',
+  'log',
+  'js',
+  'ts',
+  'py',
+  'css',
+  'java',
+  'go',
+  'rs',
+]
 /** 选择文件对话框的过滤条件 */
 export const ACCEPT = ACCEPTED_EXTS.map((ext) => `.${ext}`).join(',')
-/** 单文件大小上限与 Files API 一致 */
-export const MAX_SIZE_MB = 64
-/** 按 user_data 上传的文件（纯文本、代码、表格、电子书）原文件上限更小 */
-export const MAX_USER_DATA_SIZE_MB = 32
-export const MAX_COUNT = 50
+/** 本应用单文件大小上限，比供应商上限更严格 */
+export const MAX_SIZE_MB = 8
+/** 文本附件使用相同的业务体积上限 */
+export const MAX_USER_DATA_SIZE_MB = 8
+export const MAX_COUNT = 10
 /** 同时上传的文件数 */
-const MAX_CONCURRENT = 3
+const MAX_CONCURRENT = 2
 
 /** 文件扩展名（小写，不含点）；没有扩展名时为空 */
 export const getFileExt = (name: string) => {
@@ -118,7 +146,7 @@ const next = () => {
 
 /** 排队上传，最多同时上传 MAX_CONCURRENT 个；排队期间中止的任务不会发出请求 */
 const enqueueUpload = (
-  apiKey: string,
+  uploadKey: string,
   file: Blob,
   name: string,
   isImage: boolean,
@@ -131,8 +159,11 @@ const enqueueUpload = (
         return
       }
       try {
-        const body = file instanceof File ? file : new File([file], name, { type: file.type })
-        resolve((await uploadFile(apiKey, body, getUploadPurpose(name, isImage), signal)).id)
+        const body = new File([file], name, {
+          type: file.type || MIME_BY_EXT[getFileExt(name)] || '',
+        })
+        void isImage
+        resolve((await uploadBusinessAttachment(body, uploadKey, signal)).id)
       } catch (error) {
         reject(error)
       }
@@ -140,15 +171,11 @@ const enqueueUpload = (
     next()
   })
 
-/**
- * 上传任务按附件的本地 id 登记：输入框选中即开始上传，全部成功后携带 serverId 发送，
- * 不会重复上传；导入的历史附件没有任务，发送前按本地原件补传。
- * 任务只在内存里，历史附件补传未完成时，刷新后会在下次请求前重新上传。
- */
+/** 上传任务只保存在当前身份内存；完成后仅持有业务附件ID，不保存供应商ID。 */
 export type UploadTask =
   | { status: 'uploading' }
-  | { status: 'done'; serverId: string }
-  | { status: 'error'; error: TranslationMessage; retryable: boolean }
+  | { status: 'done'; attachmentId: string }
+  | { status: 'error'; error: TranslationMessage | string; retryable: boolean }
 
 type UploadState = { tasks: Record<string, UploadTask> }
 
@@ -163,9 +190,9 @@ const setTask = (id: string, task: UploadTask | null) =>
 
 const pending = new Map<string, { promise: Promise<string>; controller: AbortController }>()
 
-/** 开始（或复用进行中的）上传，返回服务端 file_id；失败时任务记为 error 并抛出原错误 */
+/** 开始（或复用进行中的）上传，返回业务attachmentId；失败时任务记为 error 并抛出原错误 */
 export const uploadAttachment = (
-  apiKey: string,
+  _apiKey: string,
   id: string,
   blob: Blob,
   name: string,
@@ -175,21 +202,31 @@ export const uploadAttachment = (
   if (current) {
     return current.promise
   }
+  const epoch = sessionEpoch()
   const controller = new AbortController()
   setTask(id, { status: 'uploading' })
-  const promise = enqueueUpload(apiKey, blob, name, isImage, controller.signal)
-    .then((serverId) => {
-      setTask(id, { status: 'done', serverId })
-      return serverId
+  const promise = enqueueUpload(id, blob, name, isImage, controller.signal)
+    .then((attachmentId) => {
+      assertCurrentSession(epoch)
+      controller.signal.throwIfAborted()
+      setTask(id, { status: 'done', attachmentId })
+      return attachmentId
     })
     .catch((error: unknown) => {
+      if (!isCurrentSession(epoch) || pending.get(id)?.controller !== controller) {
+        throw error
+      }
       if (controller.signal.aborted) {
         setTask(id, null)
       } else {
         setTask(id, {
           status: 'error',
-          error: describeUploadError(error),
-          retryable: isRetryableApiError(error),
+          error:
+            error instanceof AttachmentError
+              ? error.message
+              : '连接中断，上传结果未知；请勿重新上传，请联系管理员核对',
+          // 仅明确限流拒绝允许用户手动用原key重试，其他不确定结果不重传。
+          retryable: error instanceof AttachmentError && error.status === 429,
         })
         const notice = describeUploadQuota(error)
         if (notice) {
@@ -200,13 +237,56 @@ export const uploadAttachment = (
       }
       throw error
     })
-    .finally(() => pending.delete(id))
+    .finally(() => {
+      if (pending.get(id)?.controller === controller) {
+        pending.delete(id)
+      }
+    })
+  pending.set(id, { promise, controller })
+  return promise
+}
+
+/** 人工点击核对复用本次任务，网络错误不会退回原件上传路径。 */
+export const reconcileAttachment = (id: string): Promise<string> => {
+  const current = pending.get(id)
+  if (current) { return current.promise }
+  const epoch = sessionEpoch()
+  const controller = new AbortController()
+  setTask(id, { status: 'uploading' })
+  const promise = reconcileBusinessAttachment(id, controller.signal)
+    .then((result) => {
+      assertCurrentSession(epoch)
+      controller.signal.throwIfAborted()
+      setTask(id, { status: 'done', attachmentId: result.id })
+      return result.id
+    })
+    .catch((error: unknown) => {
+      if (
+        isCurrentSession(epoch) &&
+        pending.get(id)?.controller === controller &&
+        !controller.signal.aborted
+      ) {
+        setTask(id, {
+          status: 'error',
+          retryable: false,
+          error:
+            error instanceof AttachmentError
+              ? error.message
+              : '核对连接中断，请稍后再核对；不会重新上传',
+        })
+      }
+      throw error
+    })
+    .finally(() => {
+      if (pending.get(id)?.controller === controller) { pending.delete(id) }
+    })
   pending.set(id, { promise, controller })
   return promise
 }
 
 export const cancelUpload = (id: string) => {
   pending.get(id)?.controller.abort()
+  pending.delete(id)
   setTask(id, null)
 }
 
@@ -217,6 +297,19 @@ const MIME_BY_EXT: Record<string, string> = {
   jpeg: 'image/jpeg',
   gif: 'image/gif',
   webp: 'image/webp',
+  pdf: 'application/pdf',
+  txt: 'text/plain',
+  md: 'text/markdown',
+  csv: 'text/csv',
+  json: 'application/json',
+  log: 'text/plain',
+  js: 'text/javascript',
+  ts: 'text/plain',
+  py: 'text/plain',
+  css: 'text/css',
+  java: 'text/plain',
+  go: 'text/plain',
+  rs: 'text/plain',
 }
 
 /** 取文件的 MIME：优先用浏览器给出的类型，缺失时按扩展名推断 */
@@ -243,3 +336,12 @@ export const formatSize = (bytes: number) => {
   }
   return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
 }
+
+// 身份切换立即终止上传并清理内存；迟到结果不能重新填入新账号任务。
+onSessionInvalidated(() => {
+  for (const task of pending.values()) {
+    task.controller.abort()
+  }
+  pending.clear()
+  useUploads.setState({ tasks: {} })
+})

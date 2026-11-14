@@ -101,7 +101,9 @@ const SettingsContent = () => {
           ) : (
             <>
               <ApiKeyField />
-              <p>本版本不处理旧浏览器历史，导入、导出和批量清除暂不可用。原数据保持不变。</p>
+              <p>
+                本项目不提供旧历史导入或迁移，原本地数据保持不变。新云端会话导出和批量删除尚未实现。
+              </p>
               <ImportHistory historyImport={historyImport} disabled={true} />
               <ExportHistory disabled={true} />
               <SettingCell

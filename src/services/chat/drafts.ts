@@ -12,7 +12,7 @@ import {
 import type { FileAttachment } from './types.js'
 
 export type DraftAttachment = {
-  /** 本地标识，也是 IndexedDB 原件与上传任务的 key */
+  /** 本次上传幂等标识；原件仅保留在当前页面内存 */
   id: string
   file: File
   isImage: boolean
@@ -101,20 +101,20 @@ export const prepareDraftMessage = (draft: Draft, tasks: Record<string, UploadTa
   if (!text && draft.attachments.length === 0) {
     return null
   }
-  const files: (FileAttachment & { serverId: string; blob: Blob })[] = []
+  const files: (FileAttachment & { attachmentId: string })[] = []
   for (const attachment of draft.attachments) {
     const task = tasks[attachment.id]
-    if (task?.status !== 'done' || !task.serverId) {
+    if (task?.status !== 'done' || !task.attachmentId) {
       return null
     }
     files.push({
-      id: attachment.id,
-      serverId: task.serverId,
+      id: task.attachmentId,
+      attachmentId: task.attachmentId,
+      serverId: null,
       name: attachment.file.name,
       size: attachment.file.size,
       isImage: attachment.isImage,
       mimeType: resolveMimeType(attachment.file),
-      blob: attachment.file,
     })
   }
   return { text, files }
@@ -141,7 +141,7 @@ export const removeDraftAttachment = (sessionId: string | null, attachmentId: st
   }))
 }
 
-/** 发送成功后原件与 serverId 已交给会话，释放预览但保留上传完成态。 */
+/** 提交后释放本页草稿原件预览；云端仅保留业务附件引用和元数据。 */
 export const clearSentDraft = (sessionId: string | null) => {
   getDraft(sessionId).attachments.forEach((attachment) => releaseAttachment(attachment, false))
   updateDraft(sessionId, () => EMPTY_DRAFT)
@@ -158,4 +158,18 @@ export const clearAllDrafts = () => {
     draft.attachments.forEach((attachment) => releaseAttachment(attachment, true))
   }
   useDrafts.setState({ drafts: new Map() })
+}
+
+/** 新会话创建后搬移当前内存草稿，保留对象身份以识别等待期间的编辑。 */
+export const moveDraft = (from: string | null, to: string) => {
+  useDrafts.setState((state) => {
+    const current = state.drafts.get(from)
+    if (!current) {
+      return state
+    }
+    const drafts = new Map(state.drafts)
+    drafts.delete(from)
+    drafts.set(to, current)
+    return { drafts }
+  })
 }

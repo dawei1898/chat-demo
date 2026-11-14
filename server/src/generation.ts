@@ -1,3 +1,4 @@
+import { attachmentMetadata, hydrateAttachmentMessages, linkAttachments } from './attachments.js'
 import {
   bounded,
   boundedResponse,
@@ -25,6 +26,7 @@ import {
   applyEvent,
   settleReply,
   canContinueReply,
+  getContextRounds,
   toRequestMessages,
 } from '../../src/services/chat/reply.js'
 import { readServerSentEvents } from '../../src/services/api/sse.js'
@@ -37,6 +39,7 @@ export const generationInput = z
     expectedRevision: z.number().int().nonnegative().optional(),
     operation: z.enum(['send', 'edit', 'regenerate', 'continue']),
     content: z.string().trim().max(32000).optional(),
+    attachmentIds: z.array(z.string().uuid()).max(10).optional(),
     messageId: z.string().max(128).optional(),
     parentId: z.string().max(128).nullable().optional(),
     thinking: z.boolean().default(false),
@@ -77,6 +80,7 @@ export async function prepare(
           input.thinking,
           input.search,
           input.expectedRevision ?? null,
+          input.attachmentIds ?? null,
         ])
       )
       .digest('hex')
@@ -113,6 +117,10 @@ export async function prepare(
     if (recent.rows[0].n >= 10) {
       throw new HttpError(429, '调用过于频繁，请稍后再试')
     }
+    if (input.attachmentIds && !['send', 'edit'].includes(input.operation)) {
+      throw new HttpError(400, '此操作不能替换附件', 'INVALID_ATTACHMENT_OPERATION')
+    }
+    const newFiles = await attachmentMetadata(q, userId, input.attachmentIds ?? [])
     const path = getVisibleMessages(session)
     const now = Date.now()
     let history: Message[] = []
@@ -130,7 +138,7 @@ export async function prepare(
       blocks: [],
     }
     if (input.operation === 'send') {
-      if (!input.content) {
+      if (!input.content && !newFiles.length) {
         throw new HttpError(400, '消息不能为空')
       }
       const parent = path.at(-1)
@@ -144,8 +152,8 @@ export async function prepare(
       question = {
         id: randomUUID(),
         role: 'user',
-        content: input.content,
-        files: [],
+        content: input.content ?? '',
+        files: newFiles,
         createdAt: now,
       }
       session = appendBranch(session, parent?.id ?? null, [question, reply])
@@ -156,14 +164,18 @@ export async function prepare(
       }
       const target = path[index]
       if (input.operation === 'edit') {
-        if (target.role !== 'user' || !input.content) {
+        if (
+          target.role !== 'user' ||
+          (!input.content && !(input.attachmentIds === undefined ? target.files : newFiles).length)
+        ) {
           throw new HttpError(400, '只能编辑用户文本消息')
         }
         history = path.slice(0, index)
         question = {
           ...target,
           id: randomUUID(),
-          content: input.content,
+          content: input.content ?? '',
+          files: input.attachmentIds === undefined ? target.files : newFiles,
           createdAt: now,
           selectedChildId: undefined,
         }
@@ -189,9 +201,12 @@ export async function prepare(
         }
       }
     }
-    if (question.files.length || history.some((m) => m.role === 'user' && m.files.length)) {
-      throw new HttpError(400, '本地第一阶段暂不支持附件会话')
-    }
+    // 所有实际历史引用都重新核验归属与ready；重复文档按请求出现次数计入预算。
+    const userMessages = [...getContextRounds(history).map(([user]) => user), question]
+    const hydrated = await hydrateAttachmentMessages(q, userId, userMessages)
+    const byId = new Map(hydrated.map((m) => [m.id, m]))
+    const requestHistory = history.map((m) => (m.role === 'user' ? (byId.get(m.id) ?? m) : m))
+    const requestQuestion = byId.get(question.id) as UserMessage
     // appendBranch 在节点副本上补齐 parent/selectedChild。
     // 后续流式更新必须使用树内权威节点，避免旧对象覆盖关系元数据。
     const linkedReply = session.messages.find((m) => m.id === reply.id)
@@ -204,7 +219,13 @@ export async function prepare(
       model: 'deepseek-flash',
       max_tokens: config.maxTokens,
       system: '该助手为DeepSeek，由深度求索公司创造。',
-      messages: toRequestMessages(history, question, prefix, reply.thinking, reply.latestReminder),
+      messages: toRequestMessages(
+        requestHistory,
+        requestQuestion,
+        prefix,
+        reply.thinking,
+        reply.latestReminder
+      ),
       thinking: { type: reply.thinking ? 'enabled' : 'disabled' },
       tools: [
         { type: 'deepseek_read_url', name: 'deepseek_read_url' },
@@ -217,6 +238,7 @@ export async function prepare(
     }
     assertContextBudget(body)
     await saveSession(q, session)
+    await linkAttachments(q, question)
     const runId = randomUUID()
     await q.query(
       "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status,auth_session_id,request_hash) VALUES($1,$2,$3,$4,$5,$6,'running',$7,$8)",
@@ -411,6 +433,7 @@ export async function execute(
         headers: {
           'Content-Type': 'application/json',
           'x-api-key': config.deepseekKey,
+          'anthropic-beta': 'files-api-2025-04-14',
           Accept: 'text/event-stream',
         },
         body: JSON.stringify({ ...prepared.body, stream: true }),

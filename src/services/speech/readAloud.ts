@@ -4,6 +4,7 @@ import { ApiError } from '../api/client.js'
 import { classifyApiError } from '../api/errors.js'
 import { synthesize, TTS_SAMPLE_RATE } from '../api/speech.js'
 import { useSettings } from '../settings.js'
+import { createSpeechScope } from './sessionScope.js'
 
 /**
  * 朗读：同一时间只读一条回复。
@@ -23,14 +24,20 @@ export const useReadAloud = create<ReadAloudState>(() => ({ messageId: null, sta
 /** 首帧前多缓冲一点，减少网络抖动造成的断续 */
 const START_DELAY = 0.1
 
-let current: { controller: AbortController; context: AudioContext } | null = null
+let current: {
+  controller: AbortController
+  context: AudioContext
+  scope: ReturnType<typeof createSpeechScope>
+} | null = null
 
 const finish = (controller: AbortController) => {
   if (current?.controller !== controller) {
     return
   }
-  void current.context.close()
+  const previous = current
   current = null
+  previous.scope.cancel(false)
+  void previous.context.close().catch(() => {})
   useReadAloud.setState({ messageId: null, status: 'idle' })
 }
 
@@ -63,7 +70,7 @@ export const describeReadAloudError = (error: unknown): TranslationMessage | str
   }
   switch (classifyApiError(error)) {
     case 'unauthorized':
-      return { key: 'apiKeyInvalidRetry' }
+      return '登录已失效，请重新登录'
     case 'insufficientBalance':
       return { key: 'insufficientBalance' }
     case 'rateLimited':
@@ -89,21 +96,29 @@ export const toggleReadAloud = (
   }
   const controller = new AbortController()
   const context = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
-  current = { controller, context }
+  const scope = createSpeechScope(stopReadAloud)
+  current = { controller, context, scope }
   useReadAloud.setState({ messageId, status: 'loading' })
   // 音色在开始朗读时读取，设置中切换后下一次朗读生效
-  const { apiKey, ttsVoice } = useSettings.getState()
+  const { ttsVoice } = useSettings.getState()
 
   void (async () => {
     let nextTime = 0
     let lastSource: AudioBufferSourceNode | null = null
     let rest = new Uint8Array(0)
     try {
-      const stream = await synthesize(apiKey ?? '', text, ttsVoice, controller.signal)
+      const stream = await synthesize('', text, ttsVoice, controller.signal)
+      if (!scope.isCurrent() || controller.signal.aborted) {
+        await stream.cancel().catch(() => {})
+        return
+      }
       const reader = stream.getReader()
       controller.signal.addEventListener('abort', () => void reader.cancel().catch(() => {}))
       for (;;) {
         const { done, value } = await reader.read()
+        if (!scope.isCurrent() || controller.signal.aborted) {
+          break
+        }
         if (done) {
           break
         }
@@ -128,6 +143,9 @@ export const toggleReadAloud = (
         if (useReadAloud.getState().status === 'loading') {
           useReadAloud.setState({ status: 'playing' })
         }
+      }
+      if (!scope.isCurrent()) {
+        return
       }
       if (lastSource) {
         lastSource.onended = () => finish(controller)

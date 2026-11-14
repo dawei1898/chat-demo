@@ -1,5 +1,7 @@
+import { attachmentRoutes } from './attachments.js'
 import { ContextBudgetExceededError } from './context-budget.js'
 import { branchView, loadBranch } from './branch-view.js'
+import { speechRoutes, MAX_AUDIO_BYTES } from './speech.js'
 import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
@@ -33,13 +35,20 @@ import { selectVersion } from '../../src/services/chat/branches.js'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 export const app = new Hono<{ Variables: { userId: string; sessionId: string } }>()
 // 请求体上限先于认证与业务解析执行，避免无界读取。
-app.use(
-  '/api/*',
-  bodyLimit({
-    maxSize: 128 * 1024,
-    onError: (c) => c.json({ error: { message: '请求内容过大' } }, 413),
-  })
-)
+app.use('/api/*', (c, next) => {
+  // 附件路由在鉴权之后独立执行限并发、有界读取；不能在鉴权前缓冲多个大文件。
+  if (c.req.method === 'POST' && c.req.path === '/api/attachments') {
+    return next()
+  }
+  return bodyLimit({
+    // 仅ASR multipart入口有独立音频额度，其余请求仍保持128KiB。
+    maxSize:
+      c.req.method === 'POST' && c.req.path === '/api/speech/asr'
+        ? MAX_AUDIO_BYTES + 16 * 1024
+        : 128 * 1024,
+    onError: (context) => context.json({ error: { message: '请求内容过大' } }, 413),
+  })(c, next)
+})
 app.use('/api/*', async (c, next) => {
   // 私有会话不允许中间缓存；写请求必须来自配置的同源前端。
   c.header('Cache-Control', 'no-store')
@@ -103,6 +112,9 @@ app.use('/api/*', async (c, next) => {
   c.set('sessionId', session.session.id)
   return next()
 })
+// 语音继承上方同源和有效会话验证，不允许匿名调用付费能力。
+app.route('/api/speech', speechRoutes)
+app.route('/api/attachments', attachmentRoutes)
 app.get('/api/conversations', async (c) => {
   const query = new URL(c.req.url).searchParams
   const pagination = parseConversationPagination(query)

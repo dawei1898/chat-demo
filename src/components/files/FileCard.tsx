@@ -17,7 +17,9 @@ export const FileCard = ({
   status = 'done',
   error,
   onRetry,
+  retryLabel,
   onRemove,
+  removeLabel,
   onOpen,
 }: {
   name: string
@@ -25,7 +27,9 @@ export const FileCard = ({
   status?: 'uploading' | 'done' | 'error'
   error?: string
   onRetry?: () => void
+  retryLabel?: string
   onRemove?: () => void
+  removeLabel?: string
   onOpen?: () => void
 }) => {
   const t = useTranslate()
@@ -54,7 +58,7 @@ export const FileCard = ({
       title={
         status === 'error'
           ? onRetry
-            ? t('uploadRetry', { message: description })
+            ? (retryLabel ?? t('uploadRetry', { message: description }))
             : description
           : name
       }
@@ -69,7 +73,8 @@ export const FileCard = ({
         <button
           type="button"
           className={clsx(styles.remove, status === 'error' && !onRetry && styles.invalidRemove)}
-          aria-label={t('delete')}
+          aria-label={removeLabel ?? t('delete')}
+          title={removeLabel}
           onClick={(event) => {
             event.stopPropagation()
             onRemove()

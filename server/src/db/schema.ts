@@ -172,3 +172,55 @@ export const authRateLimit = pgTable(
     index('auth_rate_expiry').on(t.resetAt),
   ]
 )
+
+// 原件只交给 DeepSeek Files；业务库只存归属、状态和私有供应商引用，不存原文。
+export const attachment = pgTable(
+  'attachment',
+  {
+    id: text('id').primaryKey(),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id),
+    uploadKey: text('upload_key').notNull(),
+    contentHash: text('content_hash').notNull(),
+    name: text('name').notNull(),
+    sizeBytes: bigint('size_bytes', { mode: 'number' }).notNull(),
+    mimeType: text('mime_type').notNull(),
+    isImage: boolean('is_image').notNull(),
+    purpose: text('purpose').notNull(),
+    providerFileId: text('provider_file_id'),
+    status: text('status').notNull().default('pending'),
+    errorCode: text('error_code'),
+    cleanupPending: boolean('cleanup_pending').notNull().default(false),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+    deletedAt: timestamp('deleted_at'),
+  },
+  (t) => [
+    uniqueIndex('attachment_owner_upload_key').on(t.userId, t.uploadKey),
+    index('attachment_owner_status').on(t.userId, t.status),
+    check('attachment_size_valid', sql`${t.sizeBytes}>0 AND ${t.sizeBytes}<=8388608`),
+    check(
+      'attachment_status_valid',
+      sql`${t.status} IN ('pending','ready','failed','unknown','deleted')`
+    ),
+    check(
+      'attachment_ready_has_provider',
+      sql`${t.status}<>'ready' OR ${t.providerFileId} IS NOT NULL`
+    ),
+  ]
+)
+
+// 分支复用同一附件时只增加引用；移除草稿不能删除已被历史消息使用的文件。
+export const attachmentReference = pgTable(
+  'attachment_reference',
+  {
+    attachmentId: text('attachment_id')
+      .notNull()
+      .references(() => attachment.id),
+    messageId: text('message_id')
+      .notNull()
+      .references(() => message.id),
+  },
+  (t) => [uniqueIndex('attachment_message_unique').on(t.attachmentId, t.messageId)]
+)
