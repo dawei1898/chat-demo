@@ -105,22 +105,40 @@ export type AssistantMessage = MessageBranch & {
 
 export type Message = UserMessage | AssistantMessage
 
+export type SessionTreeNode = {
+  id: string
+  parentId: string | null
+  selectedChildId?: string
+  role: Message['role']
+  createdAt: number
+}
+
 export type Session = {
+  /** branch 标记正文仅为当前分支的已加载窗口，禁止回写完整树。 */
+  view?: 'branch'
+  /** 当前窗口之前仍有消息；beforeId 为向前分页锚点。 */
+  hasEarlier?: boolean
+  beforeId?: string | null
+  /** 服务端乐观锁版本；旧本地类型仅为兼容保留可选。 */
+  revision?: number
+  /** 全树轻量索引，用于未加载正文的兄弟版本导航。 */
+  treeIndex?: SessionTreeNode[]
   id: string
   title: string
   createdAt: number
   updatedAt: number
-  /** 包含所有分支的消息，按创建顺序存储。 */
+  /** 完整会话包含全树；branch 视图仅包含已加载的当前路径正文窗口。 */
   messages: Message[]
   /** undefined 表示线性消息列表；null 表示空会话。 */
   rootMessageId?: string | null
 }
 
 /** 会话列表元数据；消息只在打开会话时加载。 */
-export type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt'>
+export type SessionSummary = Pick<Session, 'id' | 'title' | 'createdAt' | 'updatedAt' | 'revision'>
 
 /** 显式提取字段，避免将完整会话的消息带进列表。 */
 export const toSessionSummary = (session: SessionSummary): SessionSummary => ({
+  revision: session.revision,
   id: session.id,
   title: session.title,
   createdAt: session.createdAt,

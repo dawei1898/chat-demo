@@ -12,7 +12,14 @@ const { initChat, selectSession, useChatStore, regenerateReply } =
 const { setDraftText, getDraft } = await import('../../src/services/chat/drafts.js')
 const { invalidateSession } = await import('../../src/services/auth/sessionBoundary.js')
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10))
-const sample = { id: 'test', title: 'private', createdAt: 1, updatedAt: 1, messages: [] }
+const sample = {
+  id: 'test',
+  revision: 1,
+  title: 'private',
+  createdAt: 1,
+  updatedAt: 1,
+  messages: [],
+}
 
 test('迟到列表和详情响应不能回填已退出用户的数据', async () => {
   for (const operation of ['init', 'load']) {

@@ -39,6 +39,14 @@ async function req(
   path,
   { method = 'GET', body, cookie = '', headers = {}, env = environment } = {}
 ) {
+  // 本脚本聚焦认证，业务写请求使用当前权威 revision；并发冲突在 P3 专项验证。
+  const match = path.match(/^\/api\/conversations\/([^/?]+)(?:\/generations)?$/)
+  if (match && ['PATCH', 'DELETE', 'POST'].includes(method)) {
+    const row = await client.query('SELECT version FROM conversation WHERE id=$1', [match[1]])
+    if (row.rows[0]) {
+      body = { ...body, expectedRevision: row.rows[0].version }
+    }
+  }
   return app.request(
     origin + path,
     {

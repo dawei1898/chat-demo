@@ -1,3 +1,5 @@
+import { ContextBudgetExceededError } from './context-budget.js'
+import { branchView, loadBranch } from './branch-view.js'
 import { randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
@@ -23,6 +25,7 @@ import {
   loadSession,
   saveSession,
   assertIdle,
+  assertRevision,
   recoverStale,
 } from './store.js'
 import { generationInput, prepare, execute, cancelActive } from './generation.js'
@@ -128,11 +131,17 @@ app.post('/api/conversations', async (c) => {
 })
 app.get('/api/conversations/:id', async (c) => {
   await recoverStale(c.get('userId'))
+  if (c.req.query('view') === 'branch') {
+    return c.json(
+      await loadBranch(pool, c.get('userId'), c.req.param('id'), c.req.query('beforeId'))
+    )
+  }
   return c.json(await loadSession(pool, c.get('userId'), c.req.param('id')))
 })
 app.patch('/api/conversations/:id', async (c) => {
   const body = z
     .object({
+      expectedRevision: z.number().int().nonnegative(),
       title: z.string().max(200).optional(),
       selectedMessageId: z.string().max(128).optional(),
     })
@@ -140,6 +149,7 @@ app.patch('/api/conversations/:id', async (c) => {
     .parse(await c.req.json())
   const session = await inTransaction(async (q) => {
     let s = await loadSession(q, c.get('userId'), c.req.param('id'), true)
+    assertRevision(s, body.expectedRevision)
     await assertIdle(q, s.id)
     if (body.title !== undefined) {
       s = { ...s, title: body.title }
@@ -154,19 +164,26 @@ app.patch('/api/conversations/:id', async (c) => {
     await saveSession(q, s)
     return s
   })
-  return c.json(session)
+  return c.json(c.req.query('view') === 'branch' ? branchView(session) : session)
 })
 // 用户删除会话只做软删；生成中的会话必须先停止，避免并发写入。
 app.delete('/api/conversations/:id', async (c) => {
+  const body = z
+    .object({ expectedRevision: z.number().int().nonnegative() })
+    .strict()
+    .parse(await c.req.json())
   await inTransaction(async (q) => {
     const s = await loadSession(q, c.get('userId'), c.req.param('id'), true)
+    assertRevision(s, body.expectedRevision)
     await assertIdle(q, s.id)
     await q.query('UPDATE conversation SET deleted_at=NOW() WHERE id=$1', [s.id])
   })
   return c.body(null, 204)
 })
 app.post('/api/conversations/:id/generations', async (c) => {
-  const input = generationInput.parse(await c.req.json())
+  const input = generationInput
+    .extend({ expectedRevision: z.number().int().nonnegative() })
+    .parse(await c.req.json())
   await recoverStale(c.get('userId'))
   const task = await prepare(c.get('userId'), c.req.param('id'), input, c.get('sessionId'))
   c.header('X-Accel-Buffering', 'no')
@@ -174,7 +191,12 @@ app.post('/api/conversations/:id/generations', async (c) => {
     const abort = new AbortController()
     stream.onAbort(() => abort.abort())
     await execute(task, abort.signal, async (event, data) => {
-      await stream.writeSSE({ event, data: JSON.stringify(data) })
+      const payload = data as { session?: Parameters<typeof branchView>[0] }
+      const output =
+        c.req.query('view') === 'branch' && payload.session
+          ? { ...payload, session: branchView(payload.session) }
+          : payload
+      await stream.writeSSE({ event, data: JSON.stringify(output) })
     })
   })
 })
@@ -197,6 +219,9 @@ app.post('/api/generations/:id/cancel', async (c) => {
   return c.json({ ok: true })
 })
 app.onError((error, c) => {
+  if (error instanceof ContextBudgetExceededError) {
+    return c.json({ error: { code: 'CONTEXT_BUDGET_EXCEEDED', message: error.message } }, 413)
+  }
   if (error instanceof PaginationError) {
     return c.json({ error: { message: error.message } }, 400)
   }
@@ -204,7 +229,10 @@ app.onError((error, c) => {
     return c.json({ error: { message: '参数格式不正确' } }, 400)
   }
   if (error instanceof HttpError) {
-    return c.json({ error: { message: error.message } }, error.status as ContentfulStatusCode)
+    return c.json(
+      { error: { message: error.message, ...(error.code ? { code: error.code } : {}) } },
+      error.status as ContentfulStatusCode
+    )
   }
   // 日志不记录请求头、凭据、连接串或上游正文，只保留错误类型。
   process.stderr.write(`API request failed: ${error.name}\n`)

@@ -16,7 +16,7 @@ export const normalizeSession = (session: Session): Session =>
 
 /** 展示内容与请求上下文共用当前选中的分支路径。 */
 export const getVisibleMessages = (session: Session): Message[] => {
-  if (session.rootMessageId === undefined) {
+  if (session.treeIndex || session.rootMessageId === undefined) {
     return session.messages
   }
   const byId = new Map(session.messages.map((message) => [message.id, message]))
@@ -42,7 +42,9 @@ export const buildMessageVersions = (
   previous: ReadonlyMap<string, MessageVersions>
 ): ReadonlyMap<string, MessageVersions> => {
   const groups = new Map<string | null | undefined, string[]>()
-  for (const message of session.messages) {
+  // 版本导航使用轻量全树索引，消息正文只加载当前路径。
+  const nodes = session.treeIndex ?? session.messages
+  for (const message of nodes) {
     const key = session.rootMessageId === undefined ? message.id : message.parentId
     const ids = groups.get(key)
     if (ids) {
@@ -53,7 +55,7 @@ export const buildMessageVersions = (
   }
 
   const versions = new Map<string, MessageVersions>()
-  let unchanged = previous.size === session.messages.length
+  let unchanged = previous.size === nodes.length
   for (const ids of groups.values()) {
     const cachedIds = previous.get(ids[0])?.ids
     const stableIds =

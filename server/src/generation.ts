@@ -1,10 +1,18 @@
+import { assertContextBudget } from './context-budget.js'
 import { updateAttemptUsage, normalizeUsage } from './usage.js'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { pool } from './db/client.js'
 import { config } from './config.js'
 import { sessionIsLive } from './auth-security.js'
-import { HttpError, inTransaction, loadSession, saveSession, assertIdle } from './store.js'
+import {
+  HttpError,
+  inTransaction,
+  loadSession,
+  saveSession,
+  assertIdle,
+  assertRevision,
+} from './store.js'
 import { appendBranch, getVisibleMessages } from '../../src/services/chat/branches.js'
 import {
   applyEvent,
@@ -19,6 +27,7 @@ import type { CreateMessageRequest } from '../../src/services/api/types.js'
 // 客户端只能提交操作和开关，不能伪造用户归属、历史消息或上游工具参数。
 export const generationInput = z
   .object({
+    expectedRevision: z.number().int().nonnegative().optional(),
     operation: z.enum(['send', 'edit', 'regenerate', 'continue']),
     content: z.string().trim().max(32000).optional(),
     messageId: z.string().max(128).optional(),
@@ -49,6 +58,7 @@ export async function prepare(
       throw new HttpError(401, '登录已失效，请重新登录')
     }
     let session = await loadSession(q, userId, conversationId, true)
+    assertRevision(session, input.expectedRevision)
     const duplicate = await q.query(
       'SELECT id,status FROM generation_run WHERE user_id=$1 AND idempotency_key=$2',
       [userId, input.idempotencyKey]
@@ -151,21 +161,6 @@ export async function prepare(
     }
     reply = linkedReply
     session.updatedAt = now
-    await saveSession(q, session)
-    const runId = randomUUID()
-    await q.query(
-      "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status,auth_session_id) VALUES($1,$2,$3,$4,$5,$6,'running',$7)",
-      [
-        runId,
-        userId,
-        conversationId,
-        reply.id,
-        input.idempotencyKey,
-        input.operation,
-        authSessionId ?? null,
-      ]
-    )
-    await q.query('INSERT INTO usage_record(generation_id) VALUES($1)', [runId])
     const body: CreateMessageRequest & { max_tokens: number } = {
       model: 'deepseek-flash',
       max_tokens: config.maxTokens,
@@ -181,6 +176,22 @@ export async function prepare(
       safety_check: { level: 'high' },
       title: { enabled: !session.title },
     }
+    assertContextBudget(body)
+    await saveSession(q, session)
+    const runId = randomUUID()
+    await q.query(
+      "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status,auth_session_id) VALUES($1,$2,$3,$4,$5,$6,'running',$7)",
+      [
+        runId,
+        userId,
+        conversationId,
+        reply.id,
+        input.idempotencyKey,
+        input.operation,
+        authSessionId ?? null,
+      ]
+    )
+    await q.query('INSERT INTO usage_record(generation_id) VALUES($1)', [runId])
     return { session, reply, runId, body, userId, authSessionId }
   })
 }
@@ -394,10 +405,12 @@ export async function execute(
             reply.id,
             JSON.stringify(reply),
           ])
-          await q.query(
-            "UPDATE conversation SET title=CASE WHEN title='' THEN $2 ELSE title END,updated_at=NOW(),version=version+1 WHERE id=$1",
+          const saved = await q.query(
+            "UPDATE conversation SET title=CASE WHEN title='' THEN $2 ELSE title END,updated_at=NOW(),version=version+1 WHERE id=$1 RETURNING version,updated_at",
             [session.id, session.title]
           )
+          session.revision = saved.rows[0].version
+          session.updatedAt = saved.rows[0].updated_at.getTime()
         }
       })
       await emit(errorMessage ? 'error' : 'done', {

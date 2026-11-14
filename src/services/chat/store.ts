@@ -14,6 +14,9 @@ import { clearAllDrafts, clearSentDraft, getDraft } from './drafts.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 type ChatState = {
+  nextCursor: string | null
+  loadingMore: boolean
+  listError: boolean
   ready: boolean
   initError: boolean
   importingHistory: boolean
@@ -25,6 +28,9 @@ type ChatState = {
   streaming: Record<string, AbortController>
 }
 export const useChatStore = create<ChatState>(() => ({
+  nextCursor: null,
+  loadingMore: false,
+  listError: false,
   ready: false,
   initError: false,
   importingHistory: false,
@@ -44,6 +50,9 @@ onSessionInvalidated(() => {
   creating = false
   clearAllDrafts()
   set({
+    nextCursor: null,
+    loadingMore: false,
+    listError: false,
     ready: false,
     initError: false,
     importingHistory: false,
@@ -61,6 +70,35 @@ const notify = (e: unknown) => {
     showToast(messageOf(e))
   }
 }
+class RequestError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string
+  ) {
+    super(message)
+  }
+}
+const revisionOf = (id: string) => {
+  const revision =
+    get().sessionCache[id]?.revision ?? get().sessions.find((item) => item.id === id)?.revision
+  if (revision === undefined) {
+    throw new Error('会话版本尚未加载，请刷新后重试')
+  }
+  return revision
+}
+async function handleMutationError(id: string, error: unknown, epoch: number) {
+  if (!isCurrentSession(epoch)) {
+    return
+  }
+  if (error instanceof RequestError && error.code === 'REVISION_CONFLICT') {
+    await load(id)
+    if (isCurrentSession(epoch)) {
+      notify(new Error('会话已在其他窗口更新，已刷新最新内容，请检查后重新操作'))
+    }
+  } else {
+    notify(error)
+  }
+}
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const epoch = sessionEpoch()
   const response = await fetch(`/api${path}`, {
@@ -75,13 +113,25 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
   if (!response.ok) {
     const error = await response.json().catch(() => null)
-    throw new Error(error?.error?.message ?? error?.message ?? `请求失败 (${response.status})`)
+    throw new RequestError(
+      error?.error?.message ?? error?.message ?? `请求失败 (${response.status})`,
+      error?.error?.code
+    )
   }
   const result = response.status === 204 ? (undefined as T) : ((await response.json()) as T)
   assertCurrentSession(epoch)
   return result
 }
 function put(session: Session) {
+  const current = get().sessionCache[session.id]
+  // 同一身份的并发请求也可能乱序，禁止较旧版本覆盖最新分支。
+  if (
+    current?.revision !== undefined &&
+    session.revision !== undefined &&
+    session.revision < current.revision
+  ) {
+    return
+  }
   set((s) => ({
     sessionCache: { ...s.sessionCache, [session.id]: session },
     sessions: [...s.sessions.filter((x) => x.id !== session.id), toSessionSummary(session)].sort(
@@ -89,23 +139,74 @@ function put(session: Session) {
     ),
   }))
 }
+type SessionPage = { items: SessionSummary[]; nextCursor: string | null }
+let listRequest = 0
+const mergeSummaries = (current: SessionSummary[], incoming: SessionSummary[]) => {
+  const merged = new Map(current.map((item) => [item.id, item]))
+  for (const item of incoming) {
+    const previous = merged.get(item.id)
+    if (!previous || item.updatedAt >= previous.updatedAt) {
+      merged.set(item.id, item)
+    }
+  }
+  return [...merged.values()].sort((a, b) => b.updatedAt - a.updatedAt || b.id.localeCompare(a.id))
+}
 export async function initChat() {
   const epoch = sessionEpoch()
+  const request = ++listRequest
+  set({ initError: false, loadingMore: true, listError: false })
   try {
-    set({ initError: false })
-    const sessions = await api<SessionSummary[]>('/conversations')
+    const page = await api<SessionPage>('/conversations?limit=50')
     assertCurrentSession(epoch)
-    set({ sessions, ready: true })
+    if (request !== listRequest) {
+      return
+    }
+    set({ sessions: mergeSummaries([], page.items), nextCursor: page.nextCursor, ready: true })
   } catch {
-    if (isCurrentSession(epoch)) {
+    if (isCurrentSession(epoch) && request === listRequest) {
       set({ initError: true })
+    }
+  } finally {
+    if (isCurrentSession(epoch) && request === listRequest) {
+      set({ loadingMore: false })
+    }
+  }
+}
+export async function loadMoreSessions() {
+  const state = get()
+  if (!state.ready || state.loadingMore || !state.nextCursor) {
+    return
+  }
+  const epoch = sessionEpoch()
+  const request = ++listRequest
+  const cursor = state.nextCursor
+  set({ loadingMore: true, listError: false })
+  try {
+    const page = await api<SessionPage>(
+      `/conversations?limit=50&cursor=${encodeURIComponent(cursor)}`
+    )
+    assertCurrentSession(epoch)
+    if (request !== listRequest) {
+      return
+    }
+    set((state) => ({
+      sessions: mergeSummaries(state.sessions, page.items),
+      nextCursor: page.nextCursor,
+    }))
+  } catch {
+    if (isCurrentSession(epoch) && request === listRequest) {
+      set({ listError: true })
+    }
+  } finally {
+    if (isCurrentSession(epoch) && request === listRequest) {
+      set({ loadingMore: false })
     }
   }
 }
 async function load(id: string) {
   const epoch = sessionEpoch()
   try {
-    const session = await api<Session>(`/conversations/${id}`)
+    const session = await api<Session>(`/conversations/${id}?view=branch`)
     assertCurrentSession(epoch)
     put(session)
     set((s) => ({ sessionLoadErrors: { ...s.sessionLoadErrors, [id]: false } }))
@@ -113,6 +214,47 @@ async function load(id: string) {
     if (isCurrentSession(epoch)) {
       set((s) => ({ sessionLoadErrors: { ...s.sessionLoadErrors, [id]: true } }))
     }
+  }
+}
+const earlierLoading = new Set<string>()
+export async function loadEarlierMessages(id: string) {
+  const epoch = sessionEpoch()
+  const original = get().sessionCache[id]
+  if (
+    !original?.hasEarlier ||
+    !original.beforeId ||
+    earlierLoading.has(id) ||
+    get().streaming[id]
+  ) {
+    return
+  }
+  earlierLoading.add(id)
+  try {
+    const page = await api<Session>(
+      `/conversations/${id}?view=branch&beforeId=${encodeURIComponent(original.beforeId)}`
+    )
+    assertCurrentSession(epoch)
+    const current = get().sessionCache[id]
+    if (current !== original) {
+      return
+    }
+    if (page.revision !== original.revision) {
+      await load(id)
+      notify(new Error('会话已更新，已刷新最新版本'))
+      return
+    }
+    const messages = [
+      ...page.messages,
+      ...original.messages.filter((m) => !page.messages.some((p) => p.id === m.id)),
+    ]
+    put({ ...original, messages, hasEarlier: page.hasEarlier, beforeId: page.beforeId })
+  } catch (error) {
+    if (isCurrentSession(epoch)) {
+      notify(error)
+      throw error
+    }
+  } finally {
+    earlierLoading.delete(id)
   }
 }
 export const retrySaveSessions = () => {
@@ -129,12 +271,15 @@ export const selectSession = (id: string) => {
 }
 export const renameSession = (id: string, title: string) => {
   const epoch = sessionEpoch()
-  void api<Session>(`/conversations/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) })
+  void api<Session>(`/conversations/${id}?view=branch`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title, expectedRevision: revisionOf(id) }),
+  })
     .then((session) => {
       assertCurrentSession(epoch)
       put(session)
     })
-    .catch(notify)
+    .catch((error) => void handleMutationError(id, error, epoch))
 }
 export async function removeSession(id: string) {
   const epoch = sessionEpoch()
@@ -143,7 +288,10 @@ export async function removeSession(id: string) {
     return false
   }
   try {
-    await api(`/conversations/${id}`, { method: 'DELETE' })
+    await api(`/conversations/${id}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ expectedRevision: revisionOf(id) }),
+    })
     assertCurrentSession(epoch)
     set((s) => ({
       sessions: s.sessions.filter((x) => x.id !== id),
@@ -154,7 +302,7 @@ export async function removeSession(id: string) {
     }))
     return true
   } catch (e) {
-    notify(e)
+    await handleMutationError(id, e, epoch)
     return false
   }
 }
@@ -163,15 +311,15 @@ export const selectMessageVersion = (id: string, messageId: string) => {
   if (get().streaming[id]) {
     return
   }
-  void api<Session>(`/conversations/${id}`, {
+  void api<Session>(`/conversations/${id}?view=branch`, {
     method: 'PATCH',
-    body: JSON.stringify({ selectedMessageId: messageId }),
+    body: JSON.stringify({ selectedMessageId: messageId, expectedRevision: revisionOf(id) }),
   })
     .then((session) => {
       assertCurrentSession(epoch)
       put(session)
     })
-    .catch(notify)
+    .catch((error) => void handleMutationError(id, error, epoch))
 }
 export function stopReply(id: string) {
   const runId = runs.get(id)
@@ -206,11 +354,17 @@ async function generate(id: string, input: GenerationInput) {
   let terminal = false
   try {
     const { thinking, search } = useSettings.getState()
-    const response = await fetch(`/api/conversations/${id}/generations`, {
+    const response = await fetch(`/api/conversations/${id}/generations?view=branch`, {
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...input, thinking, search, idempotencyKey: crypto.randomUUID() }),
+      body: JSON.stringify({
+        ...input,
+        expectedRevision: revisionOf(id),
+        thinking,
+        search,
+        idempotencyKey: crypto.randomUUID(),
+      }),
       signal: controller.signal,
     })
     assertCurrentSession(epoch)
@@ -220,7 +374,10 @@ async function generate(id: string, input: GenerationInput) {
     }
     if (!response.ok) {
       const error = await response.json().catch(() => null)
-      throw new Error(error?.error?.message ?? error?.message ?? `生成失败 (${response.status})`)
+      throw new RequestError(
+        error?.error?.message ?? error?.message ?? `生成失败 (${response.status})`,
+        error?.error?.code
+      )
     }
     if (!response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
       throw new Error('服务未返回 SSE 数据流')
@@ -256,7 +413,7 @@ async function generate(id: string, input: GenerationInput) {
     }
   } catch (e) {
     if (!controller.signal.aborted) {
-      notify(e)
+      await handleMutationError(id, e, epoch)
     }
   } finally {
     if (isCurrentSession(epoch)) {

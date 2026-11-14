@@ -77,6 +77,7 @@ export function parseConversationPagination(query: URLSearchParams): Conversatio
 type ConversationRow = {
   id: string
   title: string
+  version: number
   created_at: Date
   updated_at: Date
   cursor_updated_at: string
@@ -97,7 +98,7 @@ export async function listConversationPage(
   }
   values.push(limit + 1)
   const result = await db.query<ConversationRow>(
-    `SELECT id,title,created_at,updated_at,
+    `SELECT id,title,version,created_at,updated_at,
       to_char(updated_at,'YYYY-MM-DD"T"HH24:MI:SS.US') AS cursor_updated_at
      FROM conversation
      WHERE user_id=$1 AND deleted_at IS NULL${boundary}
@@ -111,6 +112,7 @@ export async function listConversationPage(
     items: rows.map((row) => ({
       id: row.id,
       title: row.title,
+      revision: row.version,
       createdAt: row.created_at.getTime(),
       updatedAt: row.updated_at.getTime(),
     })),

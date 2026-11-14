@@ -4,7 +4,12 @@ import { useTranslate } from '../../i18n/index.js'
 import { IconPanelLeftOutline16, IconSettingsOutline16, NewChatIcon } from '../base/icons.js'
 import { setSiderCollapsed } from '../../services/settings.js'
 import { groupSessions } from '../../services/chat/sessionGroups.js'
-import { newChat, removeSession, useChatStore } from '../../services/chat/store.js'
+import {
+  newChat,
+  removeSession,
+  useChatStore,
+  loadMoreSessions,
+} from '../../services/chat/store.js'
 import type { SessionSummary } from '../../services/chat/types.js'
 import { Button } from '../base/Button.js'
 import { IconButton } from '../base/IconButton.js'
@@ -19,6 +24,9 @@ import styles from './Sider.module.css'
 export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
   const t = useTranslate()
   const sessions = useChatStore((state) => state.sessions)
+  const nextCursor = useChatStore((state) => state.nextCursor)
+  const loadingMore = useChatStore((state) => state.loadingMore)
+  const listError = useChatStore((state) => state.listError)
   const activeId = useChatStore((state) => state.activeId)
   const [now, setNow] = useState(Date.now)
   const groups = useMemo(() => groupSessions(sessions, now, t), [sessions, now, t])
@@ -89,6 +97,16 @@ export const Sider = ({ mobile = false }: { mobile?: boolean }) => {
               ))}
             </div>
           ))}
+          {listError && <p role="alert">会话加载失败，请重试</p>}
+          {nextCursor && (
+            <Button
+              variant="outlined"
+              disabled={loadingMore}
+              onClick={() => void loadMoreSessions()}
+            >
+              {loadingMore ? '正在加载…' : listError ? '重试加载' : '加载更多会话'}
+            </Button>
+          )}
         </div>
       </div>
       <div className={styles.bottom}>

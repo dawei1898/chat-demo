@@ -32,7 +32,6 @@ try {
     '0001_illegal_quicksilver.sql',
     '0002_spooky_ben_grimm.sql',
     '0003_dusty_puff_adder.sql',
-    '0003_dusty_puff_adder.sql',
   ]) {
     const sql = (
       await readFile(new URL('../../migrations/' + name, import.meta.url), 'utf8')

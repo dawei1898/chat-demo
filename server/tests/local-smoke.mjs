@@ -44,8 +44,14 @@ assert.equal(create.status, 201)
 const c = await create.json()
 const read = await req('/api/conversations/' + c.id, 'GET', undefined, cookies)
 assert.equal(read.status, 200)
-const rename = await req('/api/conversations/' + c.id, 'PATCH', { title: '本地后端测试' }, cookies)
+const rename = await req(
+  '/api/conversations/' + c.id,
+  'PATCH',
+  { title: '本地后端测试', expectedRevision: c.revision },
+  cookies
+)
 assert.equal(rename.status, 200)
+const renamed = await rename.json()
 const list = await req('/api/conversations', 'GET', undefined, cookies)
 assert.ok((await list.json()).some((x) => x.id === c.id))
 const otherEmail = `isolation-${Date.now()}@example.test`
@@ -67,7 +73,12 @@ const other = otherSignin.headers
   .join('; ')
 const cross = await req('/api/conversations/' + c.id, 'GET', undefined, other)
 assert.equal(cross.status, 404)
-const del = await req('/api/conversations/' + c.id, 'DELETE', undefined, cookies)
+const del = await req(
+  '/api/conversations/' + c.id,
+  'DELETE',
+  { expectedRevision: renamed.revision },
+  cookies
+)
 assert.equal(del.status, 204)
 const signout = await req('/api/auth/sign-out', 'POST', {}, cookies)
 assert.equal(signout.status, 200)

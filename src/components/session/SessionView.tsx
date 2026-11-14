@@ -1,3 +1,5 @@
+import { useState } from 'react'
+import { loadEarlierMessages } from '../../services/chat/store.js'
 import clsx from 'clsx'
 import { useIsMobile } from '../../app/viewport.js'
 import { useTranslate } from '../../i18n/index.js'
@@ -17,6 +19,8 @@ export const SessionView = ({
   streaming: boolean
   siderCollapsed: boolean
 }) => {
+  const [loadingEarlier, setLoadingEarlier] = useState(false)
+  const [earlierError, setEarlierError] = useState(false)
   const t = useTranslate()
   const isMobile = useIsMobile()
   const title = session.title || t('untitledChat')
@@ -29,6 +33,26 @@ export const SessionView = ({
           <div className={clsx(styles.title, siderCollapsed && styles.withCollapsedSider)}>
             {title}
           </div>
+        </div>
+      )}
+      {session.hasEarlier && (
+        <div style={{ textAlign: 'center' }}>
+          <button
+            disabled={loadingEarlier || streaming}
+            onClick={async () => {
+              setLoadingEarlier(true)
+              setEarlierError(false)
+              try {
+                await loadEarlierMessages(session.id)
+              } catch {
+                setEarlierError(true)
+              } finally {
+                setLoadingEarlier(false)
+              }
+            }}
+          >
+            {loadingEarlier ? '正在加载…' : earlierError ? '加载失败，重试' : '加载更早的消息'}
+          </button>
         </div>
       )}
       <MessageList
