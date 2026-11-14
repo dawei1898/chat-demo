@@ -32,7 +32,7 @@ import { Button } from '../base/Button.js'
 import { Modal } from '../base/Modal.js'
 import { Select } from '../base/Select.js'
 import { showToast } from '../base/toastState.js'
-import { ApiKeyConfirm, ApiKeyField, useApiKeyEditor } from './ApiKeyField.js'
+import { ApiKeyConfirm, ApiKeyField } from './ApiKeyField.js'
 import { closeSettings, useSettingsDialog, type SettingsSection } from './settingsDialogState.js'
 import styles from './Settings.module.css'
 
@@ -60,11 +60,8 @@ const SettingsContent = () => {
   // 打开时按调用方指定的分组选中，之后在弹窗内切换
   const [section, setSection] = useState(() => useSettingsDialog.getState().section)
   // 切换分组不丢失正在输入的 API Key 与导入状态
-  const apiKeyEditor = useApiKeyEditor()
   const historyImport = useHistoryImport()
   const historyDelete = useHistoryDelete()
-  const replacingHistory = useChatStore((state) => state.importingHistory)
-  const historyBusy = historyImport.busy || historyDelete.busy || replacingHistory
   return (
     <>
       <Modal
@@ -103,9 +100,10 @@ const SettingsContent = () => {
             </>
           ) : (
             <>
-              <ApiKeyField editor={apiKeyEditor} />
-              <ImportHistory historyImport={historyImport} disabled={historyBusy} />
-              <ExportHistory disabled={historyBusy} />
+              <ApiKeyField />
+              <p>本版本不处理旧浏览器历史，导入、导出和批量清除暂不可用。原数据保持不变。</p>
+              <ImportHistory historyImport={historyImport} disabled={true} />
+              <ExportHistory disabled={true} />
               <SettingCell
                 label={t('deleteAllSessions')}
                 status={null}
@@ -114,14 +112,14 @@ const SettingsContent = () => {
                     variant="dangerOutlined"
                     size="m"
                     className={styles.cellButton}
-                    disabled={historyBusy}
+                    disabled={true}
                     onClick={historyDelete.open}
                   >
                     {t('delete')}
                   </Button>
                 }
               />
-              {isMobile ? <ApiKeyConfirm editor={apiKeyEditor} /> : null}
+              {isMobile ? <ApiKeyConfirm /> : null}
             </>
           )}
         </div>

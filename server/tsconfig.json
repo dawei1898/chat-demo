@@ -1,0 +1,5 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": { "noUnusedLocals": true },
+  "include": ["src/**/*.ts", "../drizzle.config.ts", "../src/env.d.ts"]
+}

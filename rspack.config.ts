@@ -86,8 +86,20 @@ export const createConfig = ({
     }),
   ],
   performance: { hints: false },
-  devServer: { port: 8090, ...devServer },
+  devServer: {
+    host: '127.0.0.1',
+    port: 8095,
+    allowedHosts: ['localhost', '127.0.0.1'],
+    ...devServer,
+  },
 })
 
 // eslint-disable-next-line import/no-default-export
-export default defineConfig(createConfig())
+export default defineConfig(
+  createConfig({
+    apiOrigin: '',
+    devServer: {
+      proxy: [{ context: ['/api'], target: 'http://127.0.0.1:8096', changeOrigin: false }],
+    },
+  })
+)
