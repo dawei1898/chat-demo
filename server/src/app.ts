@@ -5,6 +5,11 @@ import { bodyLimit } from 'hono/body-limit'
 import { z } from 'zod'
 import { auth } from './auth.js'
 import { config } from './config.js'
+import {
+  listConversationPage,
+  parseConversationPagination,
+  PaginationError,
+} from './conversation-pagination.js'
 import { pool } from './db/client.js'
 import {
   HttpError,
@@ -46,19 +51,14 @@ app.use('/api/*', async (c, next) => {
   return next()
 })
 app.get('/api/conversations', async (c) => {
+  const query = new URL(c.req.url).searchParams
+  const pagination = parseConversationPagination(query)
+  const legacy = !query.has('limit') && !query.has('cursor')
   await recoverStale(c.get('userId'))
-  const r = await pool.query(
-    'SELECT id,title,created_at,updated_at FROM conversation WHERE user_id=$1 AND deleted_at IS NULL ORDER BY updated_at DESC LIMIT 200',
-    [c.get('userId')]
-  )
-  return c.json(
-    r.rows.map((r) => ({
-      id: r.id,
-      title: r.title,
-      createdAt: r.created_at.getTime(),
-      updatedAt: r.updated_at.getTime(),
-    }))
-  )
+  const page = await listConversationPage(pool, c.get('userId'),
+    legacy ? { limit: 200, cursor: null } : pagination)
+  // Keep the existing UI contract until paginated navigation is integrated.
+  return c.json(legacy ? page.items : page)
 })
 app.post('/api/conversations', async (c) => {
   const body = z
@@ -142,6 +142,9 @@ app.post('/api/generations/:id/cancel', async (c) => {
   return c.json({ ok: true })
 })
 app.onError((error, c) => {
+  if (error instanceof PaginationError) {
+    return c.json({ error: { message: error.message } }, 400)
+  }
   if (error instanceof z.ZodError) {
     return c.json({ error: { message: '参数格式不正确' } }, 400)
   }

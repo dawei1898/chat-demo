@@ -1,8 +1,9 @@
 # chat-demo 后端接入方案
 
-> 2026-11-14。基于本次讨论重新整理的本地版本，不是此前附件的逐字副本。本次只记录方案与调整本地运行端口，尚未实现后端代理。
+> 历史选型说明，2026-11-14 更新范围。本文保留早期 BFF/业务后端/多模型的选型比较，不是当前执行计划。用户已选择直接进入 Hono + Neon PostgreSQL + Better Auth 业务后端；本地文本首版已实现。当前设计见《第二阶段业务后端与数据库改造方案》，任务状态见《第二阶段改造计划与进度清单》。
+> 数据范围：新数据起步，不读取、导入、上传或删除旧浏览器会话、附件和 ZIP，不安排存量数据迁移。Vercel 部署当前暂停。
 
-## 1. 推荐路线
+## 1. 早期路线比较（不作为当前实施顺序）
 
 先增加同协议 BFF，保留 React、Zustand、IndexedDB 及现有 Messages SSE 解析；再增加登录、PostgreSQL 会话持久化与配额。多模型统一事件放到最后，不必为了增加代理迁移 Next.js 或重写全部 UI。
 
@@ -13,7 +14,7 @@ React → 自己的后端（认证、校验、限流、注入服务端 Key）→
 
 技术选项：Hono + Node.js 适合快速沿用 TypeScript；Spring Boot 3 适合以 Java 为核心的权限和业务服务；NestJS 适合希望使用 TypeScript 模块化工程结构。技术栈与是否持久化、是否统一协议是独立选择。
 
-## 2. 当前调用入口与迁移范围
+## 2. 原项目调用入口与接口改造范围
 
 | 功能 | 当前上游路径 | 处理方式 |
 | --- | --- | --- |
@@ -53,7 +54,7 @@ React → 自己的后端（认证、校验、限流、注入服务端 Key）→
 
 表设计应至少覆盖用户、会话、消息、附件、用量；保留消息父子关系以支持编辑与重新生成分支。每条会话和附件均绑定用户。消息保存完整 content blocks，不能只存最终回答文本，否则可能丢失 thinking/tool blocks、搜索来源和续轮必要信息。
 
-保存到数据库不要求同时重做 SSE 协议，可继续使用 Messages 事件。浏览器旧记录迁入数据库需要独立导入设计，失败/中断生成应保留明确状态而不是假装成功。
+保存到数据库不要求同时重做 SSE 协议，可继续使用 Messages 事件。旧浏览器数据不属于改造范围，不建设迁移或导入功能；失败/中断生成应保留明确状态而不是假装成功。
 
 ## 5. 第三阶段：多模型统一
 
@@ -75,16 +76,8 @@ Messages 流通常经过 message_start、content_block_start/delta/stop、messag
 
 参考：https://api-docs.deepseek.com/guides/anthropic_api/
 
-## 7. 本机开发
+## 7. 当前本机开发入口
 
 本次工作目录：`/Users/fu/code/codex_projects/deepseek-chat-demo`，分支 `dev`。
 
-```sh
-pnpm install --frozen-lockfile
-pnpm type
-pnpm lint
-pnpm build
-pnpm dev
-```
-
-开发端口已设为 `8095`，只绑定 `127.0.0.1`。在同一台 Mac 上打开 `http://127.0.0.1:8095/`。当前仍是原有浏览器 Key 模式，用户自行在页面填写，不要发到聊天中。若系统 watcher 报 EMFILE，可用 `CHOKIDAR_USEPOLLING=true WATCHPACK_POLLING=true pnpm dev` 启动，避免调整系统安全设置。
+当前使用自有 Hono 后端，不再让浏览器直连模型或填写模型 Key。统一从 `http://localhost:8095/` 访问前端；Hono 仅在本机 8096 端口运行。服务端变量由项目根目录被 Git 忽略的 `.env` 提供，不在聊天或提交中传递。启动、测试及未完成范围以《本地开发启动说明》为准；本文不包含任何凭据。
