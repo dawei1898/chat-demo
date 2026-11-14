@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { pool } from './db/client.js'
 import { config } from './config.js'
+import { sessionIsLive } from './auth-security.js'
 import { HttpError, inTransaction, loadSession, saveSession, assertIdle } from './store.js'
 import { appendBranch, getVisibleMessages } from '../../src/services/chat/branches.js'
 import {
@@ -34,11 +35,19 @@ export function cancelActive(id: string) {
   active.get(id)?.abort()
 }
 /** 短事务内锁定会话、检查幂等和分支、预建回答与账本；不在事务内请求模型。 */
-export async function prepare(userId: string, conversationId: string, input: GenerationInput) {
+export async function prepare(
+  userId: string,
+  conversationId: string,
+  input: GenerationInput,
+  authSessionId?: string
+) {
   if (!config.deepseekKey) {
     throw new HttpError(503, '请在本机 .env 配置新的 DEEPSEEK_API_KEY')
   }
   return inTransaction(async (q) => {
+    if (authSessionId && !(await sessionIsLive(q, userId, authSessionId))) {
+      throw new HttpError(401, '登录已失效，请重新登录')
+    }
     let session = await loadSession(q, userId, conversationId, true)
     const duplicate = await q.query(
       'SELECT id,status FROM generation_run WHERE user_id=$1 AND idempotency_key=$2',
@@ -145,8 +154,16 @@ export async function prepare(userId: string, conversationId: string, input: Gen
     await saveSession(q, session)
     const runId = randomUUID()
     await q.query(
-      "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status) VALUES($1,$2,$3,$4,$5,$6,'running')",
-      [runId, userId, conversationId, reply.id, input.idempotencyKey, input.operation]
+      "INSERT INTO generation_run(id,user_id,conversation_id,message_id,idempotency_key,operation,status,auth_session_id) VALUES($1,$2,$3,$4,$5,$6,'running',$7)",
+      [
+        runId,
+        userId,
+        conversationId,
+        reply.id,
+        input.idempotencyKey,
+        input.operation,
+        authSessionId ?? null,
+      ]
     )
     await q.query('INSERT INTO usage_record(generation_id) VALUES($1)', [runId])
     const body: CreateMessageRequest & { max_tokens: number } = {
@@ -164,7 +181,7 @@ export async function prepare(userId: string, conversationId: string, input: Gen
       safety_check: { level: 'high' },
       title: { enabled: !session.title },
     }
-    return { session, reply, runId, body, userId }
+    return { session, reply, runId, body, userId, authSessionId }
   })
 }
 /** 事务外消费上游事件，通过短检查点事务保存部分结果，结束时原子结算。 */
@@ -191,6 +208,7 @@ export async function execute(
     timedOut = true
     abort()
   }, 240000)
+  let sessionExpired = false
   let seenStop = false
   let errorMessage: string | undefined
   const indexes = new Map<number, number>()
@@ -232,8 +250,15 @@ export async function execute(
     }
     pollBusy = true
     void pool
-      .query('SELECT cancel_requested,status FROM generation_run WHERE id=$1', [runId])
+      .query(
+        `SELECT r.cancel_requested,r.status,CASE WHEN r.auth_session_id IS NULL THEN true ELSE EXISTS(SELECT 1 FROM session s WHERE s.id=r.auth_session_id AND s.user_id=r.user_id AND s.expires_at>NOW()) END AS session_live FROM generation_run r WHERE r.id=$1`,
+        [runId]
+      )
       .then((r) => {
+        if (r.rows[0]?.session_live === false) {
+          sessionExpired = true
+          abort()
+        }
         if (r.rows[0]?.cancel_requested || r.rows[0]?.status !== 'running') {
           abort()
         }
@@ -244,6 +269,14 @@ export async function execute(
       })
   }, 1500)
   try {
+    if (
+      prepared.authSessionId &&
+      !(await sessionIsLive(pool, prepared.userId, prepared.authSessionId))
+    ) {
+      sessionExpired = true
+      abort()
+    }
+    controller.signal.throwIfAborted()
     await emit('snapshot', { session, runId })
     const response = await fetch('https://api.deepseek.com/anthropic/v1/messages', {
       method: 'POST',
@@ -278,7 +311,9 @@ export async function execute(
       if (!event) {
         continue
       }
-      if (event.type === 'message_delta' && event.usage) { sawFinalUsage = true }
+      if (event.type === 'message_delta' && event.usage) {
+        sawFinalUsage = true
+      }
       attemptUsage = updateAttemptUsage(attemptUsage, event)
       reply = applyEvent(reply, event, Date.now(), indexes)
       if (event.type === 'message_delta' && event.delta.title && !session.title) {
@@ -315,10 +350,13 @@ export async function execute(
     if (timedOut && !seenStop) {
       errorMessage = '生成超过本地开发的 240 秒上限，已保存部分内容'
     }
+    if (sessionExpired && !seenStop) {
+      errorMessage = '登录已失效，请重新登录'
+    }
     // 区分正常结束、超时和主动停止；所有路径都保留已得到的部分内容。
     const status = seenStop
       ? 'done'
-      : timedOut
+      : timedOut || sessionExpired
         ? 'error'
         : controller.signal.aborted
           ? 'stopped'
@@ -340,9 +378,18 @@ export async function execute(
           [runId, status, JSON.stringify(attemptUsage), errorMessage ?? null]
         )
         if (r.rowCount) {
-          await q.query(`UPDATE usage_record SET input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
+          await q.query(
+            `UPDATE usage_record SET input_tokens=$2,cached_input_tokens=$3,output_tokens=$4,
             raw_usage=$5,completeness=$6,updated_at=NOW() WHERE generation_id=$1`,
-            [runId, usage.input, usage.cached, usage.output, JSON.stringify(usage.raw), usage.completeness])
+            [
+              runId,
+              usage.input,
+              usage.cached,
+              usage.output,
+              JSON.stringify(usage.raw),
+              usage.completeness,
+            ]
+          )
           await q.query('UPDATE message SET payload=$2 WHERE id=$1', [
             reply.id,
             JSON.stringify(reply),
@@ -357,6 +404,7 @@ export async function execute(
         session,
         runId,
         ...(errorMessage ? { message: errorMessage } : {}),
+        ...(sessionExpired ? { code: 'SESSION_EXPIRED' } : {}),
       }).catch(() => {})
     } catch {
       await emit('error', { message: '数据库保存失败，请刷新检查已保存内容', runId }).catch(

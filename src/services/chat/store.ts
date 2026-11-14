@@ -1,9 +1,16 @@
+import {
+  sessionEpoch,
+  isCurrentSession,
+  assertCurrentSession,
+  invalidateSession,
+  onSessionInvalidated,
+} from '../auth/sessionBoundary.js'
 import { create } from 'zustand'
 import { showToast } from '../../components/base/toastState.js'
 import { useSettings } from '../settings.js'
 import { readServerSentEvents } from '../api/sse.js'
 import { getVisibleMessages } from './branches.js'
-import { clearSentDraft, getDraft } from './drafts.js'
+import { clearAllDrafts, clearSentDraft, getDraft } from './drafts.js'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
 
 type ChatState = {
@@ -31,19 +38,48 @@ export const useChatStore = create<ChatState>(() => ({
 const { getState: get, setState: set } = useChatStore
 const runs = new Map<string, string>()
 let creating = false
+onSessionInvalidated(() => {
+  Object.values(get().streaming).forEach((controller) => controller.abort())
+  runs.clear()
+  creating = false
+  clearAllDrafts()
+  set({
+    ready: false,
+    initError: false,
+    importingHistory: false,
+    sessions: [],
+    sessionCache: {},
+    sessionLoadErrors: {},
+    sessionSaveErrors: {},
+    activeId: null,
+    streaming: {},
+  })
+})
 const messageOf = (e: unknown) => (e instanceof Error ? e.message : '请求失败，请重试')
-const notify = (e: unknown) => showToast(messageOf(e))
+const notify = (e: unknown) => {
+  if (!(e instanceof DOMException && e.name === 'AbortError')) {
+    showToast(messageOf(e))
+  }
+}
 async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const epoch = sessionEpoch()
   const response = await fetch(`/api${path}`, {
     credentials: 'same-origin',
     ...init,
     headers: { 'Content-Type': 'application/json', ...init.headers },
   })
+  assertCurrentSession(epoch)
+  if (response.status === 401) {
+    invalidateSession()
+    throw new DOMException('登录已失效', 'AbortError')
+  }
   if (!response.ok) {
     const error = await response.json().catch(() => null)
     throw new Error(error?.error?.message ?? error?.message ?? `请求失败 (${response.status})`)
   }
-  return response.status === 204 ? (undefined as T) : ((await response.json()) as T)
+  const result = response.status === 204 ? (undefined as T) : ((await response.json()) as T)
+  assertCurrentSession(epoch)
+  return result
 }
 function put(session: Session) {
   set((s) => ({
@@ -54,20 +90,29 @@ function put(session: Session) {
   }))
 }
 export async function initChat() {
+  const epoch = sessionEpoch()
   try {
     set({ initError: false })
-    set({ sessions: await api<SessionSummary[]>('/conversations'), ready: true })
+    const sessions = await api<SessionSummary[]>('/conversations')
+    assertCurrentSession(epoch)
+    set({ sessions, ready: true })
   } catch {
-    set({ initError: true })
+    if (isCurrentSession(epoch)) {
+      set({ initError: true })
+    }
   }
 }
 async function load(id: string) {
+  const epoch = sessionEpoch()
   try {
     const session = await api<Session>(`/conversations/${id}`)
+    assertCurrentSession(epoch)
     put(session)
     set((s) => ({ sessionLoadErrors: { ...s.sessionLoadErrors, [id]: false } }))
   } catch {
-    set((s) => ({ sessionLoadErrors: { ...s.sessionLoadErrors, [id]: true } }))
+    if (isCurrentSession(epoch)) {
+      set((s) => ({ sessionLoadErrors: { ...s.sessionLoadErrors, [id]: true } }))
+    }
   }
 }
 export const retrySaveSessions = () => {
@@ -83,17 +128,23 @@ export const selectSession = (id: string) => {
   void load(id)
 }
 export const renameSession = (id: string, title: string) => {
+  const epoch = sessionEpoch()
   void api<Session>(`/conversations/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) })
-    .then(put)
+    .then((session) => {
+      assertCurrentSession(epoch)
+      put(session)
+    })
     .catch(notify)
 }
 export async function removeSession(id: string) {
+  const epoch = sessionEpoch()
   if (get().streaming[id]) {
     notify(new Error('请先停止生成'))
     return false
   }
   try {
     await api(`/conversations/${id}`, { method: 'DELETE' })
+    assertCurrentSession(epoch)
     set((s) => ({
       sessions: s.sessions.filter((x) => x.id !== id),
       sessionCache: Object.fromEntries(
@@ -108,6 +159,7 @@ export async function removeSession(id: string) {
   }
 }
 export const selectMessageVersion = (id: string, messageId: string) => {
+  const epoch = sessionEpoch()
   if (get().streaming[id]) {
     return
   }
@@ -115,7 +167,10 @@ export const selectMessageVersion = (id: string, messageId: string) => {
     method: 'PATCH',
     body: JSON.stringify({ selectedMessageId: messageId }),
   })
-    .then(put)
+    .then((session) => {
+      assertCurrentSession(epoch)
+      put(session)
+    })
     .catch(notify)
 }
 export function stopReply(id: string) {
@@ -142,6 +197,7 @@ type GenerationInput = {
   parentId?: string | null
 }
 async function generate(id: string, input: GenerationInput) {
+  const epoch = sessionEpoch()
   if (get().streaming[id]) {
     return
   }
@@ -157,6 +213,11 @@ async function generate(id: string, input: GenerationInput) {
       body: JSON.stringify({ ...input, thinking, search, idempotencyKey: crypto.randomUUID() }),
       signal: controller.signal,
     })
+    assertCurrentSession(epoch)
+    if (response.status === 401) {
+      invalidateSession()
+      throw new DOMException('登录已失效', 'AbortError')
+    }
     if (!response.ok) {
       const error = await response.json().catch(() => null)
       throw new Error(error?.error?.message ?? error?.message ?? `生成失败 (${response.status})`)
@@ -165,7 +226,13 @@ async function generate(id: string, input: GenerationInput) {
       throw new Error('服务未返回 SSE 数据流')
     }
     for await (const frame of readServerSentEvents(response.body, controller.signal)) {
-      const data = JSON.parse(frame.data) as { session?: Session; runId?: string; message?: string }
+      assertCurrentSession(epoch)
+      const data = JSON.parse(frame.data) as {
+        session?: Session
+        runId?: string
+        message?: string
+        code?: string
+      }
       if (data.runId) {
         runs.set(id, data.runId)
       }
@@ -173,6 +240,10 @@ async function generate(id: string, input: GenerationInput) {
         put(data.session)
       }
       if (frame.event === 'error') {
+        if (data.code === 'SESSION_EXPIRED') {
+          invalidateSession()
+          throw new DOMException('登录已失效', 'AbortError')
+        }
         throw new Error(data.message ?? '生成失败')
       }
       if (frame.event === 'done') {
@@ -188,22 +259,27 @@ async function generate(id: string, input: GenerationInput) {
       notify(e)
     }
   } finally {
-    runs.delete(id)
-    set((s) => ({
-      streaming: Object.fromEntries(Object.entries(s.streaming).filter(([key]) => key !== id)),
-    }))
-    // The backend owns persistence. Reload after cancellation rather than overwriting it with UI state.
-    await load(id)
-    if (controller.signal.aborted) {
-      for (let attempt = 0; attempt < 8; attempt += 1) {
-        const pending = get().sessionCache[id]?.messages.some(
-          (m) => m.role === 'assistant' && (m.status === 'pending' || m.status === 'streaming')
-        )
-        if (!pending) {
-          break
+    if (isCurrentSession(epoch)) {
+      runs.delete(id)
+      set((s) => ({
+        streaming: Object.fromEntries(Object.entries(s.streaming).filter(([key]) => key !== id)),
+      }))
+      // The backend owns persistence. Reload after cancellation rather than overwriting it with UI state.
+      await load(id)
+      if (controller.signal.aborted) {
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const pending = get().sessionCache[id]?.messages.some(
+            (m) => m.role === 'assistant' && (m.status === 'pending' || m.status === 'streaming')
+          )
+          if (!pending) {
+            break
+          }
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          if (!isCurrentSession(epoch)) {
+            break
+          }
+          await load(id)
         }
-        await new Promise((resolve) => setTimeout(resolve, 500))
-        await load(id)
       }
     }
   }
@@ -221,12 +297,14 @@ export function sendMessage(id: string | null) {
     notify(new Error('本地后端首版暂不支持附件'))
     return false
   }
+  const epoch = sessionEpoch()
   creating = true
   void (async () => {
     try {
       let target = id
       if (!target) {
         const session = await api<Session>('/conversations', { method: 'POST', body: '{}' })
+        assertCurrentSession(epoch)
         put(session)
         target = session.id
         set({ activeId: target })
@@ -237,7 +315,9 @@ export function sendMessage(id: string | null) {
     } catch (e) {
       notify(e)
     } finally {
-      creating = false
+      if (isCurrentSession(epoch)) {
+        creating = false
+      }
     }
   })()
   return true

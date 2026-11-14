@@ -28,7 +28,10 @@ const signup = await req('/api/auth/sign-up/email', 'POST', {
   password,
 })
 assert.equal(signup.status, 200, 'registration failed')
-const cookies = signup.headers
+// 注册不自动登录；需显式登录后获取会话 Cookie。
+const signin = await req('/api/auth/sign-in/email', 'POST', { email, password })
+assert.equal(signin.status, 200, 'login failed')
+const cookies = signin.headers
   .getSetCookie()
   .map((v) => v.split(';')[0])
   .join('; ')
@@ -45,13 +48,20 @@ const rename = await req('/api/conversations/' + c.id, 'PATCH', { title: '本地
 assert.equal(rename.status, 200)
 const list = await req('/api/conversations', 'GET', undefined, cookies)
 assert.ok((await list.json()).some((x) => x.id === c.id))
+const otherEmail = `isolation-${Date.now()}@example.test`
+const otherPassword = randomUUID() + '!'
 const otherSignup = await req('/api/auth/sign-up/email', 'POST', {
   name: 'Isolation test',
-  email: `isolation-${Date.now()}@example.test`,
-  password: randomUUID() + '!',
+  email: otherEmail,
+  password: otherPassword,
 })
 assert.equal(otherSignup.status, 200)
-const other = otherSignup.headers
+const otherSignin = await req('/api/auth/sign-in/email', 'POST', {
+  email: otherEmail,
+  password: otherPassword,
+})
+assert.equal(otherSignin.status, 200)
+const other = otherSignin.headers
   .getSetCookie()
   .map((v) => v.split(';')[0])
   .join('; ')

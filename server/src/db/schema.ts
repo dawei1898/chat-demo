@@ -109,6 +109,8 @@ export const generationRun = pgTable(
       .notNull()
       .references(() => conversation.id, { onDelete: 'cascade' }),
     messageId: text('message_id').notNull(),
+    // 会话可被撤销或删除，保留审计ID而不建立阻止注销的外键。该值不是会话token。
+    authSessionId: text('auth_session_id'),
     idempotencyKey: text('idempotency_key').notNull(),
     operation: text('operation').notNull(),
     status: text('status').notNull(),
@@ -132,16 +134,39 @@ export const generationRun = pgTable(
 // Drizzle 无法完整表达这些延迟约束；修改表结构必须走版本化迁移，不能用 push 替代。
 
 // 每次任务独立记账；未知 token 不补零，续写不能重复累计上一任务用量。
-export const usageRecord = pgTable('usage_record', {
-  generationId: text('generation_id').primaryKey().references(() => generationRun.id),
-  inputTokens: bigint('input_tokens', { mode: 'number' }),
-  cachedInputTokens: bigint('cached_input_tokens', { mode: 'number' }),
-  outputTokens: bigint('output_tokens', { mode: 'number' }),
-  rawUsage: jsonb('raw_usage'),
-  completeness: text('completeness').notNull().default('unknown'),
-  createdAt: timestamp('created_at').notNull().defaultNow(),
-  updatedAt: timestamp('updated_at').notNull().defaultNow(),
-}, (t) => [
-  check('usage_counts_nonnegative', sql`${t.inputTokens} >= 0 AND ${t.cachedInputTokens} >= 0 AND ${t.outputTokens} >= 0`),
-  check('usage_completeness_valid', sql`${t.completeness} IN ('unknown','partial','complete')`),
-])
+export const usageRecord = pgTable(
+  'usage_record',
+  {
+    generationId: text('generation_id')
+      .primaryKey()
+      .references(() => generationRun.id),
+    inputTokens: bigint('input_tokens', { mode: 'number' }),
+    cachedInputTokens: bigint('cached_input_tokens', { mode: 'number' }),
+    outputTokens: bigint('output_tokens', { mode: 'number' }),
+    rawUsage: jsonb('raw_usage'),
+    completeness: text('completeness').notNull().default('unknown'),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (t) => [
+    check(
+      'usage_counts_nonnegative',
+      sql`${t.inputTokens} >= 0 AND ${t.cachedInputTokens} >= 0 AND ${t.outputTokens} >= 0`
+    ),
+    check('usage_completeness_valid', sql`${t.completeness} IN ('unknown','partial','complete')`),
+  ]
+)
+
+// 自建认证限流使用原子数据库计数，进程重启不会清空窗口。
+export const authRateLimit = pgTable(
+  'auth_rate_limit',
+  {
+    key: text('key').primaryKey(),
+    count: integer('count').notNull(),
+    resetAt: timestamp('reset_at', { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    check('auth_rate_count_positive', sql`${t.count} > 0`),
+    index('auth_rate_expiry').on(t.resetAt),
+  ]
+)

@@ -6,6 +6,12 @@ import { z } from 'zod'
 import { auth } from './auth.js'
 import { config } from './config.js'
 import {
+  trustedPeer,
+  registrationPolicy,
+  applyAuthLimits,
+  enabledAuthPaths,
+} from './auth-security.js'
+import {
   listConversationPage,
   parseConversationPagination,
   PaginationError,
@@ -22,7 +28,7 @@ import {
 import { generationInput, prepare, execute, cancelActive } from './generation.js'
 import { selectVersion } from '../../src/services/chat/branches.js'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
-export const app = new Hono<{ Variables: { userId: string } }>()
+export const app = new Hono<{ Variables: { userId: string; sessionId: string } }>()
 // 请求体上限先于认证与业务解析执行，避免无界读取。
 app.use(
   '/api/*',
@@ -44,13 +50,54 @@ app.use('/api/*', async (c, next) => {
 })
 app.get('/api/health', (c) => c.json({ ok: true, mode: 'local-development' }))
 // 认证路由先交给 Better Auth；后续业务路由统一要求有效会话。
-app.all('/api/auth/*', (c) => auth.handler(c.req.raw))
+app.get('/api/auth-policy', (c) => c.json(registrationPolicy(trustedPeer(c))))
+app.all('/api/auth/*', async (c) => {
+  const peer = trustedPeer(c)
+  const path = c.req.path.slice('/api/auth'.length).replace(/\/+$/, '')
+  if (!enabledAuthPaths.has(path)) {
+    return c.json({ error: { message: '此认证功能未启用' } }, 404)
+  }
+  if (path === '/sign-up/email' && !registrationPolicy(peer).registrationEnabled) {
+    return c.json({ error: { code: 'REGISTRATION_DISABLED', message: '当前未开放注册' } }, 403)
+  }
+  const limit = await applyAuthLimits(pool, peer, path, c.req.raw)
+  if (!limit.allowed) {
+    c.header('Retry-After', String(limit.retryAfter))
+    return c.json({ error: { code: 'RATE_LIMITED', message: '请求过于频繁，请稍后重试' } }, 429)
+  }
+  const previous =
+    path === '/sign-out' ? await auth.api.getSession({ headers: c.req.raw.headers }) : null
+  const response = await auth.handler(c.req.raw)
+  if (path === '/sign-up/email' && !response.ok) {
+    return c.json(
+      { error: { code: 'SIGNUP_FAILED', message: '无法完成注册，请检查输入或使用已有账号登录' } },
+      400
+    )
+  }
+  if (previous && response.ok) {
+    // 注销先由认证库撤销 Cookie/session，再尽快中断当前会话发起的生成。
+    // 即便此更新失败，生成任务也会通过 session 轮询发现撤销并自行结束。
+    try {
+      const runs = await pool.query(
+        "UPDATE generation_run SET cancel_requested=true WHERE auth_session_id=$1 AND user_id=$2 AND status='running' RETURNING id",
+        [previous.session.id, previous.user.id]
+      )
+      for (const run of runs.rows) {
+        cancelActive(run.id)
+      }
+    } catch {
+      process.stderr.write('注销后的生成取消更新失败，将由会话轮询收尾\n')
+    }
+  }
+  return response
+})
 app.use('/api/*', async (c, next) => {
   const session = await auth.api.getSession({ headers: c.req.raw.headers })
   if (!session) {
     return c.json({ error: { message: '请先登录' } }, 401)
   }
   c.set('userId', session.user.id)
+  c.set('sessionId', session.session.id)
   return next()
 })
 app.get('/api/conversations', async (c) => {
@@ -58,8 +105,11 @@ app.get('/api/conversations', async (c) => {
   const pagination = parseConversationPagination(query)
   const legacy = !query.has('limit') && !query.has('cursor')
   await recoverStale(c.get('userId'))
-  const page = await listConversationPage(pool, c.get('userId'),
-    legacy ? { limit: 200, cursor: null } : pagination)
+  const page = await listConversationPage(
+    pool,
+    c.get('userId'),
+    legacy ? { limit: 200, cursor: null } : pagination
+  )
   // 分页导航尚未接入前端：无分页参数保留旧数组契约，显式参数返回分页对象。
   return c.json(legacy ? page.items : page)
 })
@@ -118,7 +168,7 @@ app.delete('/api/conversations/:id', async (c) => {
 app.post('/api/conversations/:id/generations', async (c) => {
   const input = generationInput.parse(await c.req.json())
   await recoverStale(c.get('userId'))
-  const task = await prepare(c.get('userId'), c.req.param('id'), input)
+  const task = await prepare(c.get('userId'), c.req.param('id'), input, c.get('sessionId'))
   c.header('X-Accel-Buffering', 'no')
   return streamSSE(c, async (stream) => {
     const abort = new AbortController()

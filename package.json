@@ -15,7 +15,8 @@
     "type:server": "tsc -p server/tsconfig.json",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "test:server": "node --import tsx --test server/tests/*.test.ts"
+    "test:server": "node --import tsx --test server/tests/*.test.ts",
+    "test:frontend": "node --import tsx --test tests/frontend/*.test.ts"
   },
   "dependencies": {
     "@better-auth/drizzle-adapter": "^1.7.22",
